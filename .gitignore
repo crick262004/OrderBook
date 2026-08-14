@@ -1,0 +1,13 @@
+# Build output
+build/
+
+# OS noise
+.DS_Store
+
+# Local-only workspace (knowledge base, AI workflow, session context)
+.local_docs/
+.claude/
+CLAUDE.md
+
+# Archives / local backups
+*.tar.gz
