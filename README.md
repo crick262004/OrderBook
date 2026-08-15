@@ -17,6 +17,7 @@ Requires CMake ≥ 3.28 and a C++23 compiler (Apple Clang 17+, GCC 14+, Clang 18
 cmake --preset release
 cmake --build --preset release
 ctest --preset release
+./build/release/orderbook_app
 ```
 
 Use the `debug` preset for development (also exports `compile_commands.json`).
