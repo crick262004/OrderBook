@@ -1,5 +1,7 @@
 #include "Orderbook.h"
 
+#include <algorithm>
+#include <cassert>
 #include <iterator>
 #include <numeric>
 
@@ -239,6 +241,95 @@ bool Orderbook::CanMatch(Side side, Price price) const
 
 Trades Orderbook::MatchOrders()
 {
-    // Matching engine lands in 0.5: price-time priority, FAK/FOK/Market semantics.
-    return {};
+    // Most adds don't cross the book: bail out before Trades allocates anything.
+    if (bids_.empty() || asks_.empty() || bids_.begin()->first < asks_.begin()->first)
+    {
+        return {};
+    }
+
+    Trades trades;
+    // Upper bound: every trade fully fills at least one resting order.
+    trades.reserve(orders_.size());
+
+    while (!bids_.empty() && !asks_.empty())
+    {
+        const auto bidsIt = bids_.begin();
+        const auto asksIt = asks_.begin();
+
+        if (bidsIt->first < asksIt->first)
+        {
+            break;
+        }
+
+        auto &bidOrders = bidsIt->second;
+        auto &askOrders = asksIt->second;
+
+        while (!bidOrders.empty() && !askOrders.empty())
+        {
+            const auto &bid = bidOrders.front();
+            const auto &ask = askOrders.front();
+
+            const Quantity quantity = std::min(bid->GetRemainingQuantity(), ask->GetRemainingQuantity());
+
+            // quantity is the min of both remainders, so neither Fill can overfill.
+            [[maybe_unused]] const auto bidFilled = bid->Fill(quantity);
+            [[maybe_unused]] const auto askFilled = ask->Fill(quantity);
+            assert(bidFilled.has_value() && askFilled.has_value());
+
+            trades.push_back(Trade{TradeInfo{bid->GetOrderId(), bid->GetPrice(), quantity},
+                                   TradeInfo{ask->GetOrderId(), ask->GetPrice(), quantity}});
+
+            OnOrderMatched(bid->GetPrice(), quantity, bid->IsFilled());
+            OnOrderMatched(ask->GetPrice(), quantity, ask->IsFilled());
+
+            // Pop last: bid/ask reference the front list nodes they would destroy.
+            if (bid->IsFilled())
+            {
+                orders_.erase(bid->GetOrderId());
+                bidOrders.pop_front();
+            }
+
+            if (ask->IsFilled())
+            {
+                orders_.erase(ask->GetOrderId());
+                askOrders.pop_front();
+            }
+        }
+
+        // Level bookkeeping in data_ is owned by UpdateLevelData alone: the last
+        // fill's Action::Remove already erased an emptied level's entry.
+        if (bidOrders.empty())
+        {
+            bids_.erase(bidsIt);
+        }
+
+        if (askOrders.empty())
+        {
+            asks_.erase(asksIt);
+        }
+    }
+
+    // A partially filled FillAndKill never rests: it is the incoming order, still at
+    // the front of its side's best level. 
+    // CancelOrder call self-deadlocked on the held non-recursive mutex; it is plainly
+    // safe in the single-threaded book.
+    if (!bids_.empty())
+    {
+        const auto &order = bids_.begin()->second.front();
+        if (order->GetOrderType() == OrderType::FillAndKill)
+        {
+            CancelOrder(order->GetOrderId());
+        }
+    }
+
+    if (!asks_.empty())
+    {
+        const auto &order = asks_.begin()->second.front();
+        if (order->GetOrderType() == OrderType::FillAndKill)
+        {
+            CancelOrder(order->GetOrderId());
+        }
+    }
+
+    return trades;
 }
