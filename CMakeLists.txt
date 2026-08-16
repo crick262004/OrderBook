@@ -12,5 +12,10 @@ target_compile_options(orderbook_warnings INTERFACE
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Werror>
 )
 
+# Core matching-engine library, linked by the app and (later) the test target
+add_library(orderbook STATIC Orderbook.cpp)
+target_include_directories(orderbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(orderbook PRIVATE orderbook_warnings)
+
 add_executable(orderbook_app main.cpp)
-target_link_libraries(orderbook_app PRIVATE orderbook_warnings)
+target_link_libraries(orderbook_app PRIVATE orderbook orderbook_warnings)
