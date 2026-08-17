@@ -22,6 +22,12 @@ ctest --preset release
 
 Use the `debug` preset for development (also exports `compile_commands.json`).
 
+## Tests
+
+GoogleTest (fetched automatically by CMake) drives file-based scenarios: each
+`OrderbookTest/TestFiles/*.txt` script replays add/modify/cancel actions against a fresh
+book and asserts the exact trades produced and the final book state.
+
 ## License
 
 MIT — see [LICENSE.txt](LICENSE.txt).

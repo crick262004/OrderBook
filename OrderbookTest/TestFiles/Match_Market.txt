@@ -1,0 +1,22 @@
+A B GoodTillCancel 100 10 1
+A B GoodTillCancel 101 10 2
+A B GoodTillCancel 102 10 3
+A B GoodTillCancel 103 10 4
+A B GoodTillCancel 104 10 5
+A B GoodTillCancel 105 10 6
+A B GoodTillCancel 106 10 7
+A B GoodTillCancel 107 10 8
+A B GoodTillCancel 108 10 9
+A B GoodTillCancel 109 10 10
+A S Market 0 101 11
+T 10 109 11 100 10
+T 9 108 11 100 10
+T 8 107 11 100 10
+T 7 106 11 100 10
+T 6 105 11 100 10
+T 5 104 11 100 10
+T 4 103 11 100 10
+T 3 102 11 100 10
+T 2 101 11 100 10
+T 1 100 11 100 10
+R 1 0 1
