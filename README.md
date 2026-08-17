@@ -1,5 +1,7 @@
 # OrderBook
 
+[![CI](https://github.com/crick262004/OrderBook/actions/workflows/ci.yml/badge.svg)](https://github.com/crick262004/OrderBook/actions/workflows/ci.yml)
+
 A limit order book / matching engine in modern C++23, built incrementally with a focus on
 low-latency engineering: cache-friendly data structures, zero-allocation hot paths, and
 lock-free concurrency.
