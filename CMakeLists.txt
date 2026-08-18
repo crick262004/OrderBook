@@ -22,3 +22,4 @@ target_link_libraries(orderbook_app PRIVATE orderbook orderbook_warnings)
 
 enable_testing()
 add_subdirectory(OrderbookTest)
+add_subdirectory(OrderbookBench)

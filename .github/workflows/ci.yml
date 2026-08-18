@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/${{ matrix.preset }}/_deps
-          key: deps-${{ matrix.os }}-${{ matrix.preset }}-${{ hashFiles('OrderbookTest/CMakeLists.txt') }}
+          key: deps-${{ matrix.os }}-${{ matrix.preset }}-${{ hashFiles('OrderbookTest/CMakeLists.txt', 'OrderbookBench/CMakeLists.txt') }}
 
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
