@@ -25,6 +25,7 @@
 //   A <B|S> <OrderType> <price> <quantity> <orderId>   add an order
 //   M <orderId> <B|S> <price> <quantity>               modify (cancel + re-add)
 //   C <orderId>                                        cancel
+//   P                                                  prune GoodForDay orders (close of day)
 //   T <bidId> <bidPrice> <askId> <askPrice> <quantity> expected trade, in order
 //   R <orderCount> <bidLevelCount> <askLevelCount>     expected final book (last line)
 //
@@ -39,6 +40,7 @@ enum class ActionType : std::uint8_t
     Add,
     Cancel,
     Modify,
+    Prune,
 };
 
 struct Action
@@ -215,6 +217,14 @@ Scenario ParseScenario(const std::filesystem::path &path)
             scenario.actions_.push_back(action);
             break;
         }
+        case 'P':
+        {
+            RequireTokens(tokens, 1, line);
+            Action action;
+            action.type_ = ActionType::Prune;
+            scenario.actions_.push_back(action);
+            break;
+        }
         case 'T':
         {
             RequireTokens(tokens, 6, line);
@@ -278,6 +288,9 @@ TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
         case ActionType::Cancel:
             orderbook.CancelOrder(action.orderId_);
             break;
+        case ActionType::Prune:
+            orderbook.PruneGoodForDayOrders();
+            break;
         }
     }
 
@@ -303,9 +316,10 @@ TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
 }
 
 constexpr const char *ScenarioFiles[] = {
-    "Match_GoodTillCancel.txt", "Match_FillAndKill.txt",   "Match_FillAndKill_Partial.txt",
+    "Match_GoodTillCancel.txt", "Match_FillAndKill.txt",     "Match_FillAndKill_Partial.txt",
     "Match_FillOrKill_Hit.txt", "Match_FillOrKill_Miss.txt", "Match_Market.txt",
-    "Cancel_Success.txt",       "Modify_Side.txt",
+    "Cancel_Success.txt",       "Modify_Side.txt",           "Prune_GoodForDay.txt",
+    "Prune_NoGoodForDay.txt",
 };
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, OrderbookScenarioTest, testing::ValuesIn(ScenarioFiles));

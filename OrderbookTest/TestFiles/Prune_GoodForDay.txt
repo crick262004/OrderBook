@@ -1,0 +1,5 @@
+A B GoodForDay 100 10 1
+A B GoodTillCancel 99 5 2
+A S GoodTillCancel 105 5 3
+P
+R 2 1 1

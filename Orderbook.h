@@ -12,8 +12,9 @@
 #include "Trade.h"
 #include "Usings.h"
 
-// Single-threaded by design: no internal locking. GoodForDay currently rests like
-// GoodTillCancel
+// Single-threaded by design: no internal locking. The book never reads a clock;
+// deciding when the trading day ends is the caller's policy — GoodForDay orders
+// rest like GoodTillCancel until PruneGoodForDayOrders() is called at close.
 class Orderbook
 {
 public:
@@ -27,6 +28,7 @@ public:
     Trades AddOrder(OrderPointer order);
     void CancelOrder(OrderId orderId);
     Trades ModifyOrder(OrderModify order);
+    void PruneGoodForDayOrders();
 
     [[nodiscard]] std::size_t Size() const noexcept;
     [[nodiscard]] OrderbookLevelInfos GetOrderInfos() const;

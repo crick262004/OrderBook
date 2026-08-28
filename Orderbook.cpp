@@ -95,6 +95,29 @@ void Orderbook::CancelOrder(OrderId orderId)
     OnOrderCancelled(order);
 }
 
+void Orderbook::PruneGoodForDayOrders()
+{
+    // Collect first, cancel second: CancelOrder erases from orders_, which would
+    // invalidate the iterator mid-walk. Cold path (once per trading day), so the
+    // vector allocation is acceptable.
+    OrderIds goodForDayIds;
+
+    for (const auto &[orderId, entry] : orders_) // copying a shared_ptr isn't just 16 bytes: it's an atomic refcount increment on entry and a matching atomic decrement at iteration end. Across the whole book that's two atomic operations per resting order, for a loop that only wants to read one enum. The & makes the binding a view, zero copies.
+    {
+        if (entry.order_->GetOrderType() == OrderType::GoodForDay)
+        {
+            goodForDayIds.push_back(orderId);
+        }
+    }
+
+    // Internal call into public CancelOrder
+    // small trivial scalars → copy; anything with an expensive copy constructor (shared_ptr, string, vector) or big footprint → const&
+    for (const auto orderId : goodForDayIds)
+    {
+        CancelOrder(orderId);
+    }
+}
+
 Trades Orderbook::ModifyOrder(OrderModify order)
 {
     const auto entryIt = orders_.find(order.GetOrderId());
