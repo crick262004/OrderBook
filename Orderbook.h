@@ -60,7 +60,7 @@ private:
 
     [[nodiscard]] bool CanFullyFill(Side side, Price price, Quantity quantity) const;
     [[nodiscard]] bool CanMatch(Side side, Price price) const;
-    Trades MatchOrders();
+    Trades MatchOrders(Side takerSide);
 
     std::unordered_map<Price, LevelData> data_;
     std::map<Price, OrderPointers, std::greater<Price>> bids_;

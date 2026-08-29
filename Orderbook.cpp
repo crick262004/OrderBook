@@ -57,7 +57,7 @@ Trades Orderbook::AddOrder(OrderPointer order)
 
     OnOrderAdded(order);
 
-    return MatchOrders();
+    return MatchOrders(order->GetSide());
 }
 
 void Orderbook::CancelOrder(OrderId orderId)
@@ -262,7 +262,7 @@ bool Orderbook::CanMatch(Side side, Price price) const
     return price <= bestBid;
 }
 
-Trades Orderbook::MatchOrders()
+Trades Orderbook::MatchOrders(Side takerSide)
 {
     // Most adds don't cross the book: bail out before Trades allocates anything.
     if (bids_.empty() || asks_.empty() || bids_.begin()->first < asks_.begin()->first)
@@ -299,9 +299,15 @@ Trades Orderbook::MatchOrders()
             [[maybe_unused]] const auto askFilled = ask->Fill(quantity);
             assert(bidFilled.has_value() && askFilled.has_value());
 
-            trades.push_back(Trade{TradeInfo{bid->GetOrderId(), bid->GetPrice(), quantity},
-                                   TradeInfo{ask->GetOrderId(), ask->GetPrice(), quantity}});
+            // Trades execute at the maker's (resting order's) price: the book is never
+            // crossed at rest, so the resting side is always opposite the incoming taker.
+            const Price executionPrice = takerSide == Side::Buy ? ask->GetPrice() : bid->GetPrice();
 
+            trades.push_back(Trade{TradeInfo{bid->GetOrderId(), executionPrice, quantity},
+                                   TradeInfo{ask->GetOrderId(), executionPrice, quantity}});
+
+            // Level bookkeeping keeps each order's own price: executionPrice is a
+            // reporting concept, but the quantity left the level the order rests at.
             OnOrderMatched(bid->GetPrice(), quantity, bid->IsFilled());
             OnOrderMatched(ask->GetPrice(), quantity, ask->IsFilled());
 

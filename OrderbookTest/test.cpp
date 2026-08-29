@@ -318,8 +318,8 @@ TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
 constexpr const char *ScenarioFiles[] = {
     "Match_GoodTillCancel.txt", "Match_FillAndKill.txt",     "Match_FillAndKill_Partial.txt",
     "Match_FillOrKill_Hit.txt", "Match_FillOrKill_Miss.txt", "Match_Market.txt",
-    "Cancel_Success.txt",       "Modify_Side.txt",           "Prune_GoodForDay.txt",
-    "Prune_NoGoodForDay.txt",
+    "Match_PriceImprovement.txt", "Cancel_Success.txt",      "Modify_Side.txt",
+    "Prune_GoodForDay.txt",     "Prune_NoGoodForDay.txt",
 };
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, OrderbookScenarioTest, testing::ValuesIn(ScenarioFiles));
