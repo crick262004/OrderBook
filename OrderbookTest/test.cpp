@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -273,8 +272,8 @@ TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
         {
         case ActionType::Add:
         {
-            const auto newTrades = orderbook.AddOrder(std::make_shared<Order>(
-                action.orderType_, action.orderId_, action.side_, action.price_, action.quantity_));
+            const auto newTrades = orderbook.AddOrder(
+                Order{action.orderType_, action.orderId_, action.side_, action.price_, action.quantity_});
             trades.insert(trades.end(), newTrades.begin(), newTrades.end());
             break;
         }

@@ -15,10 +15,10 @@ public:
     [[nodiscard]] constexpr Price GetPrice() const noexcept { return price_; }
     [[nodiscard]] constexpr Quantity GetQuantity() const noexcept { return quantity_; }
 
-    // Modify is cancel + re-add: build the replacement order. 
-    [[nodiscard]] OrderPointer ToOrderPointer(OrderType type) const
+    // Modify is cancel + re-add: build the replacement order.
+    [[nodiscard]] Order ToOrder(OrderType type) const noexcept
     {
-        return std::make_shared<Order>(type, GetOrderId(), GetSide(), GetPrice(), GetQuantity());
+        return Order{type, GetOrderId(), GetSide(), GetPrice(), GetQuantity()};
     }
 
 private:

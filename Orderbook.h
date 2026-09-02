@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <map>
 #include <unordered_map>
 
@@ -11,6 +12,11 @@
 #include "OrderbookLevelInfos.h"
 #include "Trade.h"
 #include "Usings.h"
+
+// The level FIFO owns its Orders by value: an order's single home is its list
+// node, and everything else (orders_, locals during matching) holds non-owning
+// views — iterators and references whose validity ends when the node is erased.
+using OrderList = std::list<Order>;
 
 // Single-threaded by design: no internal locking. The book never reads a clock;
 // deciding when the trading day ends is the caller's policy — GoodForDay orders
@@ -25,7 +31,7 @@ public:
     Orderbook &operator=(Orderbook &&) = delete;
     ~Orderbook() = default;
 
-    Trades AddOrder(OrderPointer order);
+    Trades AddOrder(Order order);
     void CancelOrder(OrderId orderId);
     Trades ModifyOrder(OrderModify order);
     void PruneGoodForDayOrders();
@@ -34,12 +40,6 @@ public:
     [[nodiscard]] OrderbookLevelInfos GetOrderInfos() const;
 
 private:
-    struct OrderEntry
-    {
-        OrderPointer order_{nullptr};
-        OrderPointers::iterator location_;
-    };
-
     struct LevelData
     {
         Quantity quantity_{};
@@ -53,8 +53,8 @@ private:
         };
     };
 
-    void OnOrderCancelled(const OrderPointer &order);
-    void OnOrderAdded(const OrderPointer &order);
+    void OnOrderCancelled(const Order &order);
+    void OnOrderAdded(const Order &order);
     void OnOrderMatched(Price price, Quantity quantity, bool isFullyFilled);
     void UpdateLevelData(Price price, Quantity quantity, LevelData::Action action);
 
@@ -63,7 +63,9 @@ private:
     Trades MatchOrders(Side takerSide);
 
     std::unordered_map<Price, LevelData> data_;
-    std::map<Price, OrderPointers, std::greater<Price>> bids_;
-    std::map<Price, OrderPointers, std::less<Price>> asks_;
-    std::unordered_map<OrderId, OrderEntry> orders_;
+    std::map<Price, OrderList, std::greater<Price>> bids_;
+    std::map<Price, OrderList, std::less<Price>> asks_;
+    // List iterators stay valid until their own node is erased, so the index
+    // needs nothing else: *iterator reaches the Order for O(1) cancel/lookup.
+    std::unordered_map<OrderId, OrderList::iterator> orders_;
 };

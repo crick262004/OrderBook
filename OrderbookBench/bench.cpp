@@ -1,5 +1,4 @@
 #include <cstdint>
-#include <memory>
 
 #include <benchmark/benchmark.h>
 
@@ -11,9 +10,9 @@
 
 // Steady-state hot-path baselines. Every measured iteration leaves the
 // book at its starting depth, so growth of the std::map/std::list containers never
-// pollutes the per-iteration average. The std::make_shared per add is deliberately
-// inside the timed loop: today the allocation IS part of the hot path; Phase 1
-// exists to remove it, and this baseline is what that claim gets measured against.
+// pollutes the per-iteration average. Order construction stays inside the timed
+// loop: since 1.1 it is a stack value (the shared_ptr control block and refcounts
+// are gone), but the list-node and map allocations remain until Phases 1.2/2.
 
 namespace
 {
@@ -25,8 +24,8 @@ void FillBids(Orderbook &book, std::int64_t depth)
 {
     for (std::int64_t i = 1; i <= depth; ++i)
     {
-        book.AddOrder(std::make_shared<Order>(OrderType::GoodTillCancel, static_cast<OrderId>(i), Side::Buy,
-                                              static_cast<Price>(i), RestingQuantity));
+        book.AddOrder(Order{OrderType::GoodTillCancel, static_cast<OrderId>(i), Side::Buy, static_cast<Price>(i),
+                            RestingQuantity});
     }
 }
 
@@ -42,8 +41,7 @@ void BM_AddCancel(benchmark::State &state)
 
     for (auto _ : state)
     {
-        auto trades =
-            book.AddOrder(std::make_shared<Order>(OrderType::GoodTillCancel, orderId, Side::Buy, price, RestingQuantity));
+        auto trades = book.AddOrder(Order{OrderType::GoodTillCancel, orderId, Side::Buy, price, RestingQuantity});
         benchmark::DoNotOptimize(trades);
         book.CancelOrder(orderId);
     }
@@ -63,10 +61,9 @@ void BM_AddMatch(benchmark::State &state)
 
     for (auto _ : state)
     {
-        auto trades = book.AddOrder(
-            std::make_shared<Order>(OrderType::GoodTillCancel, askId, Side::Sell, topPrice, RestingQuantity));
+        auto trades = book.AddOrder(Order{OrderType::GoodTillCancel, askId, Side::Sell, topPrice, RestingQuantity});
         benchmark::DoNotOptimize(trades);
-        book.AddOrder(std::make_shared<Order>(OrderType::GoodTillCancel, bidId, Side::Buy, topPrice, RestingQuantity));
+        book.AddOrder(Order{OrderType::GoodTillCancel, bidId, Side::Buy, topPrice, RestingQuantity});
     }
 }
 

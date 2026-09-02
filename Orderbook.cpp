@@ -5,29 +5,29 @@
 #include <iterator>
 #include <numeric>
 
-Trades Orderbook::AddOrder(OrderPointer order)
+Trades Orderbook::AddOrder(Order order)
 {
-    if (orders_.contains(order->GetOrderId()))
+    if (orders_.contains(order.GetOrderId()))
     {
         return {};
     }
 
-    if (order->GetOrderType() == OrderType::Market)
+    if (order.GetOrderType() == OrderType::Market)
     {
         // A market order pegs itself to the worst resting price on the opposite
         // side, so it sweeps every level the book can offer.
-        if (order->GetSide() == Side::Buy && !asks_.empty())
+        if (order.GetSide() == Side::Buy && !asks_.empty())
         {
             const auto &[worstAsk, _] = *asks_.rbegin();
-            if (!order->ToGoodTillCancel(worstAsk))
+            if (!order.ToGoodTillCancel(worstAsk))
             {
                 return {};
             }
         }
-        else if (order->GetSide() == Side::Sell && !bids_.empty())
+        else if (order.GetSide() == Side::Sell && !bids_.empty())
         {
             const auto &[worstBid, _] = *bids_.rbegin();
-            if (!order->ToGoodTillCancel(worstBid))
+            if (!order.ToGoodTillCancel(worstBid))
             {
                 return {};
             }
@@ -38,26 +38,28 @@ Trades Orderbook::AddOrder(OrderPointer order)
         }
     }
 
-    if (order->GetOrderType() == OrderType::FillAndKill && !CanMatch(order->GetSide(), order->GetPrice()))
+    if (order.GetOrderType() == OrderType::FillAndKill && !CanMatch(order.GetSide(), order.GetPrice()))
     {
         return {};
     }
 
-    if (order->GetOrderType() == OrderType::FillOrKill &&
-        !CanFullyFill(order->GetSide(), order->GetPrice(), order->GetInitialQuantity()))
+    if (order.GetOrderType() == OrderType::FillOrKill &&
+        !CanFullyFill(order.GetSide(), order.GetPrice(), order.GetInitialQuantity()))
     {
         return {};
     }
 
-    auto &levelOrders = order->GetSide() == Side::Buy ? bids_[order->GetPrice()] : asks_[order->GetPrice()];
-    levelOrders.push_back(order);
+    auto &levelOrders = order.GetSide() == Side::Buy ? bids_[order.GetPrice()] : asks_[order.GetPrice()];
+    levelOrders.push_back(std::move(order));
     const auto iterator = std::prev(levelOrders.end());
 
-    orders_.insert({order->GetOrderId(), OrderEntry{order, iterator}});
+    // The node is the order's single home from here on; read via the iterator,
+    // never the moved-from parameter.
+    orders_.insert({iterator->GetOrderId(), iterator});
 
-    OnOrderAdded(order);
+    OnOrderAdded(*iterator);
 
-    return MatchOrders(order->GetSide());
+    return MatchOrders(iterator->GetSide());
 }
 
 void Orderbook::CancelOrder(OrderId orderId)
@@ -68,12 +70,18 @@ void Orderbook::CancelOrder(OrderId orderId)
         return;
     }
 
-    const auto [order, iterator] = entryIt->second;
+    // Copy out, then destroy: the map entry owns the iterator and the list node
+    // owns the Order itself, so neither may be read after its erase. (The old
+    // shared_ptr copy silently kept the Order alive past the node erase.)
+    const auto iterator = entryIt->second;
+    const auto price = iterator->GetPrice();
+    const auto side = iterator->GetSide();
+
+    OnOrderCancelled(*iterator);
+
     orders_.erase(entryIt);
 
-    const auto price = order->GetPrice();
-
-    if (order->GetSide() == Side::Sell)
+    if (side == Side::Sell)
     {
         auto &levelOrders = asks_.at(price);
         levelOrders.erase(iterator);
@@ -91,8 +99,6 @@ void Orderbook::CancelOrder(OrderId orderId)
             bids_.erase(price);
         }
     }
-
-    OnOrderCancelled(order);
 }
 
 void Orderbook::PruneGoodForDayOrders()
@@ -102,9 +108,9 @@ void Orderbook::PruneGoodForDayOrders()
     // vector allocation is acceptable.
     OrderIds goodForDayIds;
 
-    for (const auto &[orderId, entry] : orders_) // copying a shared_ptr isn't just 16 bytes: it's an atomic refcount increment on entry and a matching atomic decrement at iteration end. Across the whole book that's two atomic operations per resting order, for a loop that only wants to read one enum. The & makes the binding a view, zero copies.
+    for (const auto &[orderId, iterator] : orders_)
     {
-        if (entry.order_->GetOrderType() == OrderType::GoodForDay)
+        if (iterator->GetOrderType() == OrderType::GoodForDay)
         {
             goodForDayIds.push_back(orderId);
         }
@@ -126,10 +132,10 @@ Trades Orderbook::ModifyOrder(OrderModify order)
         return {};
     }
 
-    const auto orderType = entryIt->second.order_->GetOrderType();
+    const auto orderType = entryIt->second->GetOrderType();
 
     CancelOrder(order.GetOrderId());
-    return AddOrder(order.ToOrderPointer(orderType));
+    return AddOrder(order.ToOrder(orderType));
 }
 
 std::size_t Orderbook::Size() const noexcept
@@ -144,11 +150,11 @@ OrderbookLevelInfos Orderbook::GetOrderInfos() const
     bidInfos.reserve(bids_.size());
     askInfos.reserve(asks_.size());
 
-    const auto createLevelInfo = [](Price price, const OrderPointers &levelOrders)
+    const auto createLevelInfo = [](Price price, const OrderList &levelOrders)
     {
         return LevelInfo{price, std::accumulate(levelOrders.begin(), levelOrders.end(), Quantity{0},
-                                                [](Quantity runningSum, const OrderPointer &order)
-                                                { return runningSum + order->GetRemainingQuantity(); })};
+                                                [](Quantity runningSum, const Order &order)
+                                                { return runningSum + order.GetRemainingQuantity(); })};
     };
 
     for (const auto &[price, levelOrders] : bids_)
@@ -164,14 +170,14 @@ OrderbookLevelInfos Orderbook::GetOrderInfos() const
     return OrderbookLevelInfos{bidInfos, askInfos};
 }
 
-void Orderbook::OnOrderCancelled(const OrderPointer &order)
+void Orderbook::OnOrderCancelled(const Order &order)
 {
-    UpdateLevelData(order->GetPrice(), order->GetRemainingQuantity(), LevelData::Action::Remove);
+    UpdateLevelData(order.GetPrice(), order.GetRemainingQuantity(), LevelData::Action::Remove);
 }
 
-void Orderbook::OnOrderAdded(const OrderPointer &order)
+void Orderbook::OnOrderAdded(const Order &order)
 {
-    UpdateLevelData(order->GetPrice(), order->GetInitialQuantity(), LevelData::Action::Add);
+    UpdateLevelData(order.GetPrice(), order.GetInitialQuantity(), LevelData::Action::Add);
 }
 
 void Orderbook::OnOrderMatched(Price price, Quantity quantity, bool isFullyFilled)
@@ -289,38 +295,40 @@ Trades Orderbook::MatchOrders(Side takerSide)
 
         while (!bidOrders.empty() && !askOrders.empty())
         {
-            const auto &bid = bidOrders.front();
-            const auto &ask = askOrders.front();
+            // References, never copies: Fill must shrink the order resting in the
+            // book, not a stack duplicate the loop would then re-read forever.
+            Order &bid = bidOrders.front();
+            Order &ask = askOrders.front();
 
-            const Quantity quantity = std::min(bid->GetRemainingQuantity(), ask->GetRemainingQuantity());
+            const Quantity quantity = std::min(bid.GetRemainingQuantity(), ask.GetRemainingQuantity());
 
             // quantity is the min of both remainders, so neither Fill can overfill.
-            [[maybe_unused]] const auto bidFilled = bid->Fill(quantity);
-            [[maybe_unused]] const auto askFilled = ask->Fill(quantity);
+            [[maybe_unused]] const auto bidFilled = bid.Fill(quantity);
+            [[maybe_unused]] const auto askFilled = ask.Fill(quantity);
             assert(bidFilled.has_value() && askFilled.has_value());
 
             // Trades execute at the maker's (resting order's) price: the book is never
             // crossed at rest, so the resting side is always opposite the incoming taker.
-            const Price executionPrice = takerSide == Side::Buy ? ask->GetPrice() : bid->GetPrice();
+            const Price executionPrice = takerSide == Side::Buy ? ask.GetPrice() : bid.GetPrice();
 
-            trades.push_back(Trade{TradeInfo{bid->GetOrderId(), executionPrice, quantity},
-                                   TradeInfo{ask->GetOrderId(), executionPrice, quantity}});
+            trades.push_back(Trade{TradeInfo{bid.GetOrderId(), executionPrice, quantity},
+                                   TradeInfo{ask.GetOrderId(), executionPrice, quantity}});
 
             // Level bookkeeping keeps each order's own price: executionPrice is a
             // reporting concept, but the quantity left the level the order rests at.
-            OnOrderMatched(bid->GetPrice(), quantity, bid->IsFilled());
-            OnOrderMatched(ask->GetPrice(), quantity, ask->IsFilled());
+            OnOrderMatched(bid.GetPrice(), quantity, bid.IsFilled());
+            OnOrderMatched(ask.GetPrice(), quantity, ask.IsFilled());
 
-            // Pop last: bid/ask reference the front list nodes they would destroy.
-            if (bid->IsFilled())
+            // Pop last: bid/ask are the front nodes' Orders; popping destroys them.
+            if (bid.IsFilled())
             {
-                orders_.erase(bid->GetOrderId());
+                orders_.erase(bid.GetOrderId());
                 bidOrders.pop_front();
             }
 
-            if (ask->IsFilled())
+            if (ask.IsFilled())
             {
-                orders_.erase(ask->GetOrderId());
+                orders_.erase(ask.GetOrderId());
                 askOrders.pop_front();
             }
         }
@@ -344,19 +352,19 @@ Trades Orderbook::MatchOrders(Side takerSide)
     // safe in the single-threaded book.
     if (!bids_.empty())
     {
-        const auto &order = bids_.begin()->second.front();
-        if (order->GetOrderType() == OrderType::FillAndKill)
+        const Order &order = bids_.begin()->second.front();
+        if (order.GetOrderType() == OrderType::FillAndKill)
         {
-            CancelOrder(order->GetOrderId());
+            CancelOrder(order.GetOrderId());
         }
     }
 
     if (!asks_.empty())
     {
-        const auto &order = asks_.begin()->second.front();
-        if (order->GetOrderType() == OrderType::FillAndKill)
+        const Order &order = asks_.begin()->second.front();
+        if (order.GetOrderType() == OrderType::FillAndKill)
         {
-            CancelOrder(order->GetOrderId());
+            CancelOrder(order.GetOrderId());
         }
     }
 

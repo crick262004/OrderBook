@@ -1,8 +1,6 @@
 #pragma once
 
 #include <expected>
-#include <list>
-#include <memory>
 
 #include "Constants.h"
 #include "OrderError.h"
@@ -68,6 +66,3 @@ private:
     OrderType orderType_;
     Side side_;
 };
-
-using OrderPointer = std::shared_ptr<Order>;
-using OrderPointers = std::list<OrderPointer>;
