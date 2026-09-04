@@ -6,25 +6,36 @@
 #include <list>
 #include <map>
 #include <unordered_map>
+#include <vector>
 
 #include "Order.h"
 #include "OrderModify.h"
+#include "OrderPool.h"
 #include "OrderbookLevelInfos.h"
 #include "Trade.h"
 #include "Usings.h"
 
-// The level FIFO owns its Orders by value: an order's single home is its list
-// node, and everything else (orders_, locals during matching) holds non-owning
-// views — iterators and references whose validity ends when the node is erased.
-using OrderList = std::list<Order>;
+// The arena owns every live Order; an order's single home is its pool slot,
+// addressed by a 4-byte OrderIndex that never changes for the order's lifetime.
+// The level FIFO is a queue of those indices (its nodes still heap-allocate
+// until the intrusive links of 2.2), and everything else holds non-owning
+// views whose validity ends when the slot is freed.
+using OrderList = std::list<OrderIndex>;
 
 // Single-threaded by design: no internal locking. The book never reads a clock;
 // deciding when the trading day ends is the caller's policy — GoodForDay orders
 // rest like GoodTillCancel until PruneGoodForDayOrders() is called at close.
+//
+// Capacity contract: `capacity` bounds both the number of resting orders and
+// the order-id space — ids are venue-assigned dense integers in [0, capacity).
+// An id outside that range, a duplicate id, or a full pool rejects the order
+// (empty Trades, book untouched) — backpressure, never a throw, never a resize.
 class Orderbook
 {
 public:
-    Orderbook() = default;
+    static constexpr OrderIndex DefaultCapacity = 1u << 20;
+
+    explicit Orderbook(OrderIndex capacity = DefaultCapacity);
     Orderbook(const Orderbook &) = delete;
     Orderbook &operator=(const Orderbook &) = delete;
     Orderbook(Orderbook &&) = delete;
@@ -40,6 +51,12 @@ public:
     [[nodiscard]] OrderbookLevelInfos GetOrderInfos() const;
 
 private:
+    struct OrderEntry
+    {
+        OrderIndex slot_{Constants::InvalidIndex}; // InvalidIndex <=> this id is not live
+        OrderList::iterator location_;             // queue position, for O(1) cancel
+    };
+
     struct LevelData
     {
         Quantity quantity_{};
@@ -65,7 +82,8 @@ private:
     std::unordered_map<Price, LevelData> data_;
     std::map<Price, OrderList, std::greater<Price>> bids_;
     std::map<Price, OrderList, std::less<Price>> asks_;
-    // List iterators stay valid until their own node is erased, so the index
-    // needs nothing else: *iterator reaches the Order for O(1) cancel/lookup.
-    std::unordered_map<OrderId, OrderList::iterator> orders_;
+    OrderPool pool_;
+    // Flat order index: the OrderId IS the array position (see the capacity
+    // contract above) — one array access, no hashing, no per-insert node.
+    std::vector<OrderEntry> orders_;
 };

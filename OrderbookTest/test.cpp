@@ -10,8 +10,10 @@
 
 #include <gtest/gtest.h>
 
+#include "Constants.h"
 #include "Order.h"
 #include "OrderModify.h"
+#include "OrderPool.h"
 #include "OrderType.h"
 #include "Orderbook.h"
 #include "Side.h"
@@ -322,5 +324,84 @@ constexpr const char *ScenarioFiles[] = {
 };
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, OrderbookScenarioTest, testing::ValuesIn(ScenarioFiles));
+
+// Arena mechanics, tested against the pool directly: slot identity, LIFO
+// recycling, and full-pool rejection (unreachable via Orderbook, whose id
+// contract caps live orders at pool capacity).
+TEST(OrderPoolTest, AllocatesUntilFullThenRejects)
+{
+    OrderPool pool{2};
+
+    const auto first = pool.Alloc(Order{OrderType::GoodTillCancel, 0, Side::Buy, 100, 10});
+    const auto second = pool.Alloc(Order{OrderType::GoodTillCancel, 1, Side::Buy, 101, 10});
+    EXPECT_NE(first, Constants::InvalidIndex);
+    EXPECT_NE(second, Constants::InvalidIndex);
+    EXPECT_EQ(pool.Size(), 2u);
+
+    EXPECT_EQ(pool.Alloc(Order{OrderType::GoodTillCancel, 2, Side::Buy, 102, 10}), Constants::InvalidIndex);
+    EXPECT_EQ(pool.Size(), 2u);
+}
+
+TEST(OrderPoolTest, ReusesFreedSlotLifo)
+{
+    OrderPool pool{3};
+
+    const auto first = pool.Alloc(Order{OrderType::GoodTillCancel, 0, Side::Buy, 100, 10});
+    const auto second = pool.Alloc(Order{OrderType::GoodTillCancel, 1, Side::Sell, 101, 10});
+
+    pool.Free(first);
+    EXPECT_EQ(pool.Size(), 1u);
+
+    // LIFO: the most recently freed slot is handed out first, and the survivor
+    // is untouched by the recycling.
+    const auto third = pool.Alloc(Order{OrderType::GoodTillCancel, 2, Side::Buy, 102, 7});
+    EXPECT_EQ(third, first);
+    EXPECT_EQ(pool[third].GetOrderId(), 2u);
+    EXPECT_EQ(pool[third].GetRemainingQuantity(), 7u);
+    EXPECT_EQ(pool[second].GetOrderId(), 1u);
+}
+
+// The capacity contract at the book's boundary: ids are dense in [0, capacity),
+// duplicates and out-of-range ids are rejected with the book untouched.
+TEST(OrderbookCapacityTest, RejectsIdAtOrBeyondCapacity)
+{
+    Orderbook orderbook{4};
+
+    EXPECT_TRUE(orderbook.AddOrder(Order{OrderType::GoodTillCancel, 4, Side::Buy, 100, 10}).empty());
+    EXPECT_EQ(orderbook.Size(), 0u);
+
+    EXPECT_TRUE(orderbook.AddOrder(Order{OrderType::GoodTillCancel, 3, Side::Buy, 100, 10}).empty());
+    EXPECT_EQ(orderbook.Size(), 1u);
+}
+
+TEST(OrderbookCapacityTest, RejectsDuplicateIdWhileLive)
+{
+    Orderbook orderbook{4};
+
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 100, 10});
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 105, 5});
+    EXPECT_EQ(orderbook.Size(), 1u);
+
+    const auto levels = orderbook.GetOrderInfos();
+    ASSERT_EQ(levels.GetBids().size(), 1u);
+    EXPECT_EQ(levels.GetBids().front().price_, 100);
+}
+
+TEST(OrderbookCapacityTest, IdReusableAfterCancel)
+{
+    Orderbook orderbook{2};
+
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Buy, 100, 10});
+    orderbook.CancelOrder(0);
+    EXPECT_EQ(orderbook.Size(), 0u);
+
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Sell, 105, 5});
+    EXPECT_EQ(orderbook.Size(), 1u);
+
+    const auto levels = orderbook.GetOrderInfos();
+    EXPECT_TRUE(levels.GetBids().empty());
+    ASSERT_EQ(levels.GetAsks().size(), 1u);
+    EXPECT_EQ(levels.GetAsks().front().price_, 105);
+}
 
 } // namespace

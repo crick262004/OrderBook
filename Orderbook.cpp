@@ -5,9 +5,15 @@
 #include <iterator>
 #include <numeric>
 
+Orderbook::Orderbook(OrderIndex capacity) : pool_{capacity}, orders_(capacity)
+{
+}
+
 Trades Orderbook::AddOrder(Order order)
 {
-    if (orders_.contains(order.GetOrderId()))
+    // Capacity contract: the id is the position in the flat index, so an id at
+    // or beyond capacity is rejected exactly like a duplicate.
+    if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()].slot_ != Constants::InvalidIndex)
     {
         return {};
     }
@@ -49,37 +55,46 @@ Trades Orderbook::AddOrder(Order order)
         return {};
     }
 
-    auto &levelOrders = order.GetSide() == Side::Buy ? bids_[order.GetPrice()] : asks_[order.GetPrice()];
-    levelOrders.push_back(std::move(order));
-    const auto iterator = std::prev(levelOrders.end());
+    const auto slot = pool_.Alloc(std::move(order));
+    if (slot == Constants::InvalidIndex)
+    {
+        // Pool full: backpressure, the order is rejected with the book untouched.
+        return {};
+    }
 
-    // The node is the order's single home from here on; read via the iterator,
+    // The slot is the order's single home from here on; read via the pool,
     // never the moved-from parameter.
-    orders_.insert({iterator->GetOrderId(), iterator});
+    const Order &resting = pool_[slot];
 
-    OnOrderAdded(*iterator);
+    auto &levelOrders = resting.GetSide() == Side::Buy ? bids_[resting.GetPrice()] : asks_[resting.GetPrice()];
+    levelOrders.push_back(slot);
 
-    return MatchOrders(iterator->GetSide());
+    orders_[resting.GetOrderId()] = OrderEntry{slot, std::prev(levelOrders.end())};
+
+    OnOrderAdded(resting);
+
+    return MatchOrders(resting.GetSide());
 }
 
 void Orderbook::CancelOrder(OrderId orderId)
 {
-    const auto entryIt = orders_.find(orderId);
-    if (entryIt == orders_.end())
+    if (orderId >= orders_.size() || orders_[orderId].slot_ == Constants::InvalidIndex)
     {
         return;
     }
 
-    // Copy out, then destroy: the map entry owns the iterator and the list node
-    // owns the Order itself, so neither may be read after its erase. (The old
-    // shared_ptr copy silently kept the Order alive past the node erase.)
-    const auto iterator = entryIt->second;
-    const auto price = iterator->GetPrice();
-    const auto side = iterator->GetSide();
+    // Copy out, then destroy: the Order dies when its slot is freed, so
+    // everything bookkeeping needs is read before Free.
+    const auto [slot, iterator] = orders_[orderId];
+    const auto price = pool_[slot].GetPrice();
+    const auto side = pool_[slot].GetSide();
 
-    OnOrderCancelled(*iterator);
+    OnOrderCancelled(pool_[slot]);
 
-    orders_.erase(entryIt);
+    // Reset discipline: a removed id must read as not-live immediately, or a
+    // stale id would later reach a recycled slot holding a stranger's order.
+    orders_[orderId].slot_ = Constants::InvalidIndex;
+    pool_.Free(slot);
 
     if (side == Side::Sell)
     {
@@ -108,9 +123,12 @@ void Orderbook::PruneGoodForDayOrders()
     // vector allocation is acceptable.
     OrderIds goodForDayIds;
 
-    for (const auto &[orderId, iterator] : orders_)
+    // Walks the whole id space, not just live orders — O(capacity) is fine on
+    // the once-per-day path, and it needs no auxiliary live-order structure.
+    for (OrderId orderId = 0; orderId < orders_.size(); ++orderId)
     {
-        if (iterator->GetOrderType() == OrderType::GoodForDay)
+        const auto slot = orders_[orderId].slot_;
+        if (slot != Constants::InvalidIndex && pool_[slot].GetOrderType() == OrderType::GoodForDay)
         {
             goodForDayIds.push_back(orderId);
         }
@@ -126,13 +144,12 @@ void Orderbook::PruneGoodForDayOrders()
 
 Trades Orderbook::ModifyOrder(OrderModify order)
 {
-    const auto entryIt = orders_.find(order.GetOrderId());
-    if (entryIt == orders_.end())
+    if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()].slot_ == Constants::InvalidIndex)
     {
         return {};
     }
 
-    const auto orderType = entryIt->second->GetOrderType();
+    const auto orderType = pool_[orders_[order.GetOrderId()].slot_].GetOrderType();
 
     CancelOrder(order.GetOrderId());
     return AddOrder(order.ToOrder(orderType));
@@ -140,7 +157,7 @@ Trades Orderbook::ModifyOrder(OrderModify order)
 
 std::size_t Orderbook::Size() const noexcept
 {
-    return orders_.size();
+    return pool_.Size();
 }
 
 OrderbookLevelInfos Orderbook::GetOrderInfos() const
@@ -150,11 +167,11 @@ OrderbookLevelInfos Orderbook::GetOrderInfos() const
     bidInfos.reserve(bids_.size());
     askInfos.reserve(asks_.size());
 
-    const auto createLevelInfo = [](Price price, const OrderList &levelOrders)
+    const auto createLevelInfo = [this](Price price, const OrderList &levelOrders)
     {
         return LevelInfo{price, std::accumulate(levelOrders.begin(), levelOrders.end(), Quantity{0},
-                                                [](Quantity runningSum, const Order &order)
-                                                { return runningSum + order.GetRemainingQuantity(); })};
+                                                [this](Quantity runningSum, OrderIndex slot)
+                                                { return runningSum + pool_[slot].GetRemainingQuantity(); })};
     };
 
     for (const auto &[price, levelOrders] : bids_)
@@ -295,10 +312,13 @@ Trades Orderbook::MatchOrders(Side takerSide)
 
         while (!bidOrders.empty() && !askOrders.empty())
         {
+            const OrderIndex bidSlot = bidOrders.front();
+            const OrderIndex askSlot = askOrders.front();
+
             // References, never copies: Fill must shrink the order resting in the
-            // book, not a stack duplicate the loop would then re-read forever.
-            Order &bid = bidOrders.front();
-            Order &ask = askOrders.front();
+            // pool, not a stack duplicate the loop would then re-read forever.
+            Order &bid = pool_[bidSlot];
+            Order &ask = pool_[askSlot];
 
             const Quantity quantity = std::min(bid.GetRemainingQuantity(), ask.GetRemainingQuantity());
 
@@ -319,16 +339,20 @@ Trades Orderbook::MatchOrders(Side takerSide)
             OnOrderMatched(bid.GetPrice(), quantity, bid.IsFilled());
             OnOrderMatched(ask.GetPrice(), quantity, ask.IsFilled());
 
-            // Pop last: bid/ask are the front nodes' Orders; popping destroys them.
+            // Free last: bid/ask reference the slots being released — nothing may
+            // read them after Free. Same reset discipline as CancelOrder: the id
+            // must stop reading as live before its slot can be recycled.
             if (bid.IsFilled())
             {
-                orders_.erase(bid.GetOrderId());
+                orders_[bid.GetOrderId()].slot_ = Constants::InvalidIndex;
+                pool_.Free(bidSlot);
                 bidOrders.pop_front();
             }
 
             if (ask.IsFilled())
             {
-                orders_.erase(ask.GetOrderId());
+                orders_[ask.GetOrderId()].slot_ = Constants::InvalidIndex;
+                pool_.Free(askSlot);
                 askOrders.pop_front();
             }
         }
@@ -352,7 +376,7 @@ Trades Orderbook::MatchOrders(Side takerSide)
     // safe in the single-threaded book.
     if (!bids_.empty())
     {
-        const Order &order = bids_.begin()->second.front();
+        const Order &order = pool_[bids_.begin()->second.front()];
         if (order.GetOrderType() == OrderType::FillAndKill)
         {
             CancelOrder(order.GetOrderId());
@@ -361,7 +385,7 @@ Trades Orderbook::MatchOrders(Side takerSide)
 
     if (!asks_.empty())
     {
-        const Order &order = asks_.begin()->second.front();
+        const Order &order = pool_[asks_.begin()->second.front()];
         if (order.GetOrderType() == OrderType::FillAndKill)
         {
             CancelOrder(order.GetOrderId());
