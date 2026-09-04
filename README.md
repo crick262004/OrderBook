@@ -40,7 +40,7 @@ one row per optimization commit, all measured on the same machine (±10% laptop 
 |---|---|---|---|
 | `5dd83af` | Baseline: `shared_ptr` orders, `std::map` levels, hash-map order index | 67 / 69 / 72 | 199 / 208 / 246 |
 | `5b18318` | Single ownership: orders by value in level nodes, no `shared_ptr` | 45 / 43 / 44 | 150 / 152 / 204 |
-| _pending_ | Arena: pooled orders, index handles, flat id→slot lookup | 23 / 25 / 26 | 134 / 136 / 148 |
+| `f6bf84b` | Arena: pooled orders, index handles, flat id→slot lookup | 23 / 25 / 26 | 134 / 136 / 148 |
 
 ## License
 
