@@ -9,10 +9,11 @@
 #include "Usings.h"
 
 // Steady-state hot-path baselines. Every measured iteration leaves the
-// book at its starting depth, so growth of the std::map/std::list containers never
-// pollutes the per-iteration average. Order construction stays inside the timed
-// loop: since 1.1 it is a stack value (the shared_ptr control block and refcounts
-// are gone), but the list-node and map allocations remain until Phases 1.2/2.
+// book at its starting depth, so growth of the containers never pollutes the
+// per-iteration average. Order construction stays inside the timed loop: since
+// 1.1 it is a stack value, since 1.2 it lands in the arena, and since 2.1 the
+// price levels are contiguous — the level FIFO's list node is the one remaining
+// per-order allocation (2.2).
 
 namespace
 {

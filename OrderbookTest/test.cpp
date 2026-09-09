@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +17,7 @@
 #include "OrderPool.h"
 #include "OrderType.h"
 #include "Orderbook.h"
+#include "PriceLevels.h"
 #include "Side.h"
 #include "Trade.h"
 #include "Usings.h"
@@ -402,6 +404,101 @@ TEST(OrderbookCapacityTest, IdReusableAfterCancel)
     EXPECT_TRUE(levels.GetBids().empty());
     ASSERT_EQ(levels.GetAsks().size(), 1u);
     EXPECT_EQ(levels.GetAsks().front().price_, 105);
+}
+
+// Flat level mechanics, tested against PriceLevels directly: sort direction per
+// side, the touch at the back, mid-array birth/death, and growth past the reserve.
+std::vector<Price> BestFirstPrices(const auto &levels)
+{
+    std::vector<Price> prices;
+    for (const auto &[price, level] : levels.BestFirst())
+    {
+        prices.push_back(price);
+    }
+    return prices;
+}
+
+TEST(PriceLevelsTest, SortsTowardTheTouchOnBothSides)
+{
+    PriceLevels<std::greater<Price>> bids{4};
+    PriceLevels<std::less<Price>> asks{4};
+
+    for (const Price price : {100, 105, 95})
+    {
+        [[maybe_unused]] auto &bidLevel = bids.FindOrCreate(price);
+        [[maybe_unused]] auto &askLevel = asks.FindOrCreate(price);
+    }
+
+    EXPECT_EQ(bids.BestPrice(), 105);
+    EXPECT_EQ(bids.WorstPrice(), 95);
+    EXPECT_EQ(BestFirstPrices(bids), (std::vector<Price>{105, 100, 95}));
+
+    EXPECT_EQ(asks.BestPrice(), 95);
+    EXPECT_EQ(asks.WorstPrice(), 105);
+    EXPECT_EQ(BestFirstPrices(asks), (std::vector<Price>{95, 100, 105}));
+}
+
+TEST(PriceLevelsTest, FindOrCreateReturnsTheExistingLevel)
+{
+    PriceLevels<std::greater<Price>> bids{4};
+
+    auto &created = bids.FindOrCreate(100);
+    created.orders_.push_back(7);
+    created.count_ = 1;
+    created.quantity_ = 10;
+
+    const auto &found = bids.FindOrCreate(100);
+    EXPECT_EQ(bids.Size(), 1u);
+    EXPECT_EQ(found.count_, 1u);
+    EXPECT_EQ(found.quantity_, 10u);
+    EXPECT_EQ(found.orders_.front(), 7u);
+
+    EXPECT_EQ(bids.Find(101), nullptr);
+    ASSERT_NE(bids.Find(100), nullptr);
+    EXPECT_EQ(bids.Find(100)->count_, 1u);
+}
+
+TEST(PriceLevelsTest, EraseMidArrayKeepsOrderAndGrowsPastReserve)
+{
+    PriceLevels<std::less<Price>> asks{2};
+
+    for (const Price price : {103, 101, 105, 102, 104})
+    {
+        [[maybe_unused]] auto &level = asks.FindOrCreate(price);
+    }
+    EXPECT_EQ(asks.Size(), 5u);
+    EXPECT_EQ(BestFirstPrices(asks), (std::vector<Price>{101, 102, 103, 104, 105}));
+
+    asks.Erase(*asks.Find(103));
+    EXPECT_EQ(asks.Find(103), nullptr);
+    EXPECT_EQ(BestFirstPrices(asks), (std::vector<Price>{101, 102, 104, 105}));
+
+    asks.PopBest();
+    EXPECT_EQ(asks.BestPrice(), 102);
+    EXPECT_EQ(asks.WorstPrice(), 105);
+    EXPECT_EQ(asks.Size(), 3u);
+}
+
+// Aggregates ride on the level: a snapshot must report the sum of remaining
+// quantity after a partial fill, and a level must die with its last order.
+TEST(OrderbookLevelTest, LevelQuantityTracksRemainingAfterPartialFill)
+{
+    Orderbook orderbook{4};
+
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Sell, 100, 10});
+    const auto trades = orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 100, 30});
+    ASSERT_EQ(trades.size(), 1u);
+
+    auto levels = orderbook.GetOrderInfos();
+    EXPECT_TRUE(levels.GetAsks().empty());
+    ASSERT_EQ(levels.GetBids().size(), 1u);
+    EXPECT_EQ(levels.GetBids().front().price_, 100);
+    EXPECT_EQ(levels.GetBids().front().quantity_, 20u);
+
+    orderbook.CancelOrder(1);
+    levels = orderbook.GetOrderInfos();
+    EXPECT_TRUE(levels.GetBids().empty());
+    EXPECT_EQ(orderbook.Size(), 0u);
 }
 
 } // namespace
