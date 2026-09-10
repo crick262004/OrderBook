@@ -2,7 +2,14 @@
 
 #include <cassert>
 
-MatchingEngine::MatchingEngine(OrderIndex capacity) : book_{capacity}, thread_{[this] { Run(); }} {}
+MatchingEngine::MatchingEngine(OrderIndex capacity, std::optional<unsigned> core)
+    : book_{capacity}, thread_{[this] { Run(); }}
+{
+    if (core.has_value())
+    {
+        affinity_ = PinToCore(thread_, *core);
+    }
+}
 
 MatchingEngine::~MatchingEngine()
 {
@@ -52,6 +59,9 @@ const Orderbook &MatchingEngine::Book() const noexcept
 
 void MatchingEngine::Run()
 {
+    // Where the OS has no hard affinity, at least ask for its fast cores.
+    PreferPerformanceCores();
+
     // A named lvalue, so the TradeSink built from it below points at live stack
     // for the whole loop (a FunctionRef borrows; a temporary lambda would dangle).
     // A trade is never dropped: a full outbound ring stalls matching until the
@@ -69,7 +79,8 @@ void MatchingEngine::Run()
         if (command == nullptr)
         {
             // Busy-wait: this thread's whole job is to be here the instant a
-            // command lands. No yield, no sleep — roadmap 3.2 pins it to a core.
+            // command lands. No yield, no sleep, no spin hint (measured slower,
+            // see Affinity.h) — it is pinned to a core for exactly this.
             continue;
         }
 

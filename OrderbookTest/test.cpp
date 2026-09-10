@@ -15,6 +15,11 @@
 
 #include <gtest/gtest.h>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
+#include "Affinity.h"
 #include "Command.h"
 #include "Constants.h"
 #include "FunctionRef.h"
@@ -826,6 +831,69 @@ TEST(MatchingEngineTest, ReportsEachFillOnceInOrderThroughTheOutboundRing)
     engine.PopTrade();
 
     EXPECT_EQ(engine.NextTrade(), nullptr);
+    EXPECT_EQ(engine.Book().Size(), 0u);
+}
+
+// Affinity: a hard pin is verified on Linux by asking the kernel where the
+// thread actually runs; macOS has no hard affinity and must say Unsupported
+// rather than pretend.
+TEST(AffinityTest, PinsTheCallingThreadWhereTheOsAllows)
+{
+    const ScopedPin pin{0};
+#if defined(__linux__)
+    ASSERT_TRUE(pin.Result().has_value());
+    EXPECT_EQ(sched_getcpu(), 0);
+#else
+    ASSERT_FALSE(pin.Result().has_value());
+    EXPECT_EQ(pin.Result().error(), AffinityError::Unsupported);
+#endif
+}
+
+TEST(AffinityTest, PinsAnotherThreadWhereTheOsAllows)
+{
+    std::atomic<bool> go{false};
+    std::atomic<int> ranOn{-1};
+    std::thread worker{[&go, &ranOn]
+                       {
+                           while (!go.load(std::memory_order_acquire))
+                           {
+                           }
+#if defined(__linux__)
+                           ranOn.store(sched_getcpu(), std::memory_order_release);
+#else
+                           ranOn.store(-1, std::memory_order_release); // no pin happened, no core to report
+#endif
+                       }};
+
+    const auto pinned = PinToCore(worker, 0);
+    go.store(true, std::memory_order_release);
+    worker.join();
+
+#if defined(__linux__)
+    ASSERT_TRUE(pinned.has_value());
+    EXPECT_EQ(ranOn.load(std::memory_order_acquire), 0);
+#else
+    ASSERT_FALSE(pinned.has_value());
+    EXPECT_EQ(pinned.error(), AffinityError::Unsupported);
+    EXPECT_EQ(ranOn.load(std::memory_order_acquire), -1);
+#endif
+}
+
+TEST(MatchingEngineTest, ReportsThePinOutcomeAndKeepsMatching)
+{
+    MatchingEngine engine{8, 0u};
+#if defined(__linux__)
+    EXPECT_TRUE(engine.Affinity().has_value());
+#else
+    ASSERT_FALSE(engine.Affinity().has_value());
+    EXPECT_EQ(engine.Affinity().error(), AffinityError::Unsupported);
+#endif
+
+    engine.Submit(Command::Add(Order{OrderType::GoodTillCancel, 0, Side::Sell, 100, 5}));
+    engine.Submit(Command::Add(Order{OrderType::GoodTillCancel, 1, Side::Buy, 100, 5}));
+    engine.Stop();
+
+    ASSERT_NE(engine.NextTrade(), nullptr);
     EXPECT_EQ(engine.Book().Size(), 0u);
 }
 

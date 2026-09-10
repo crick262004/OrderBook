@@ -6,11 +6,13 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <optional>
 #include <thread>
 #include <vector>
 
 #include <benchmark/benchmark.h>
 
+#include "Affinity.h"
 #include "Command.h"
 #include "MatchingEngine.h"
 #include "Order.h"
@@ -184,6 +186,21 @@ using PackedRing = SpscQueue<std::uint64_t, 1024, alignof(std::atomic<std::uint6
 
 constexpr std::uint64_t Poison = 0;
 
+// Cores for the pinned variants: the last two the OS reports, the least likely
+// to be hosting something else on a busy machine. On macOS pinning reports
+// Unsupported and the pinned variants measure the same thing as the unpinned.
+unsigned PingCore()
+{
+    const auto cores = std::thread::hardware_concurrency();
+    return cores >= 2 ? cores - 2 : 0;
+}
+
+unsigned PongCore()
+{
+    const auto cores = std::thread::hardware_concurrency();
+    return cores >= 2 ? cores - 1 : 0;
+}
+
 // Echo thread: pops each request and pushes it straight back; exits on Poison.
 template <typename Ring>
 std::thread StartEcho(Ring &request, Ring &response)
@@ -233,17 +250,35 @@ void StopEcho(Ring &request, std::thread &echo)
     echo.join();
 }
 
+// Pins this thread and the echo thread to two fixed cores for the benchmark's
+// duration (the main thread's mask is restored after). Records whether the OS
+// honoured both pins as the `pinned` counter — before the allocation scope
+// opens, since inserting a counter allocates.
+template <bool Pinned>
+void PinPair(benchmark::State &state, std::optional<ScopedPin> &pin, std::thread &echo)
+{
+    bool pinned = false;
+    if constexpr (Pinned)
+    {
+        pin.emplace(PingCore());
+        pinned = pin->Result().has_value() && PinToCore(echo, PongCore()).has_value();
+    }
+    state.counters["pinned"] = pinned ? 1.0 : 0.0;
+}
+
 // Two threads, two rings: this thread pushes a request, the echo thread pops it
 // and pushes it back, this thread waits for the reply. One iteration is one
 // round trip = two cross-core hand-offs, i.e. twice the cache-line transfer
-// latency between whichever cores the OS picked (3.2 pins them) plus, for the
-// packed control, the counters' false-sharing tax.
-template <typename Ring>
+// latency between the two cores — whichever the OS picked, or the pinned pair —
+// plus, for the packed control, the counters' false-sharing tax.
+template <typename Ring, bool Pinned>
 void BM_SpscPingPong(benchmark::State &state)
 {
     Ring request;
     Ring response;
     std::thread echo = StartEcho(request, response);
+    std::optional<ScopedPin> pin;
+    PinPair<Pinned>(state, pin, echo);
 
     const AllocationScope allocations{state};
     for (auto _ : state)
@@ -257,7 +292,7 @@ void BM_SpscPingPong(benchmark::State &state)
 // The same round trip with every iteration timed individually, so the tail is
 // visible: pinning and layout move p99 and max far more than the mean. The two
 // clock reads add ~20 ns per iteration, so compare p50 here with the mean above.
-template <typename Ring>
+template <typename Ring, bool Pinned>
 void BM_SpscPingPongTail(benchmark::State &state)
 {
     Ring request;
@@ -265,6 +300,8 @@ void BM_SpscPingPongTail(benchmark::State &state)
     // Sized before the allocation scope: the samples are harness, not ring.
     std::vector<std::int64_t> samples(static_cast<std::size_t>(state.max_iterations));
     std::thread echo = StartEcho(request, response);
+    std::optional<ScopedPin> pin;
+    PinPair<Pinned>(state, pin, echo);
 
     std::size_t count = 0;
     {
@@ -294,10 +331,21 @@ void BM_SpscPingPongTail(benchmark::State &state)
 // come back out, replenish the bid. One iteration is order-in to trade-out
 // latency: two ring hops + the add + the match + the sink's push, on a book of
 // the given depth. Compare with BM_AddMatch to see what the thread boundary costs.
+// The pinned variant puts the matching thread and this feed thread on two fixed cores.
+template <bool Pinned>
 void BM_EngineRoundTrip(benchmark::State &state)
 {
     const auto depth = state.range(0);
-    MatchingEngine engine;
+    MatchingEngine engine{Orderbook::DefaultCapacity, Pinned ? std::optional<unsigned>{PongCore()} : std::nullopt};
+    std::optional<ScopedPin> pin;
+    bool pinned = false;
+    if constexpr (Pinned)
+    {
+        pin.emplace(PingCore());
+        pinned = pin->Result().has_value() && engine.Affinity().has_value();
+    }
+    state.counters["pinned"] = pinned ? 1.0 : 0.0;
+
     for (std::int64_t i = 1; i <= depth; ++i)
     {
         engine.Submit(Command::Add(RestingBid(i)));
@@ -326,10 +374,13 @@ void BM_EngineRoundTrip(benchmark::State &state)
 BENCHMARK(BM_AddCancel)->RangeMultiplier(10)->Range(100, 10'000);
 BENCHMARK(BM_AddMatch)->RangeMultiplier(10)->Range(100, 10'000);
 BENCHMARK(BM_SpscPushPop);
-BENCHMARK_TEMPLATE(BM_SpscPingPong, PaddedRing)->Name("BM_SpscPingPong/padded")->UseRealTime();
-BENCHMARK_TEMPLATE(BM_SpscPingPong, PackedRing)->Name("BM_SpscPingPong/packed")->UseRealTime();
-BENCHMARK_TEMPLATE(BM_SpscPingPongTail, PaddedRing)->Name("BM_SpscPingPongTail/padded")->UseRealTime();
-BENCHMARK_TEMPLATE(BM_SpscPingPongTail, PackedRing)->Name("BM_SpscPingPongTail/packed")->UseRealTime();
-BENCHMARK(BM_EngineRoundTrip)->Arg(1'000)->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPong, PaddedRing, false)->Name("BM_SpscPingPong/padded")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPong, PackedRing, false)->Name("BM_SpscPingPong/packed")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPong, PaddedRing, true)->Name("BM_SpscPingPong/padded/pinned")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPongTail, PaddedRing, false)->Name("BM_SpscPingPongTail/padded")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPongTail, PackedRing, false)->Name("BM_SpscPingPongTail/packed")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPongTail, PaddedRing, true)->Name("BM_SpscPingPongTail/padded/pinned")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_EngineRoundTrip, false)->Name("BM_EngineRoundTrip")->Arg(1'000)->UseRealTime();
+BENCHMARK_TEMPLATE(BM_EngineRoundTrip, true)->Name("BM_EngineRoundTrip/pinned")->Arg(1'000)->UseRealTime();
 
 } // namespace

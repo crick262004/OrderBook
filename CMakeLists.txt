@@ -15,7 +15,7 @@ target_compile_options(orderbook_warnings INTERFACE
 # Core matching-engine library, linked by the app, the tests and the benchmarks.
 # MatchingEngine runs the book on its own std::jthread, hence Threads.
 find_package(Threads REQUIRED)
-add_library(orderbook STATIC Orderbook.cpp MatchingEngine.cpp)
+add_library(orderbook STATIC Orderbook.cpp MatchingEngine.cpp Affinity.cpp)
 target_include_directories(orderbook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(orderbook PUBLIC Threads::Threads PRIVATE orderbook_warnings)
 

@@ -72,6 +72,12 @@ layout differs, so the 110 ns gap is the tax of two writers sharing a cache line
 ~20 µs max in both layouts is OS preemption of an unpinned spinning thread — the number
 thread pinning targets.
 
+Pinning (`ScopedPin`, `MatchingEngine{capacity, core}`) is hard affinity on Linux, verified in
+CI by asking the kernel which core the pinned thread runs on. macOS offers no hard affinity, so
+on this machine the `/pinned` benchmark variants report `pinned=0` and match the unpinned
+numbers; pinned latencies await a Linux run. A spin-loop hint (`isb`) was tried and measured at
++40 ns per round trip, so the wait loops stay tight.
+
 ## License
 
 MIT — see [LICENSE.txt](LICENSE.txt).

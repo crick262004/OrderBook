@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstddef>
+#include <expected>
+#include <optional>
 #include <thread>
 
+#include "Affinity.h"
 #include "Command.h"
 #include "Orderbook.h"
 #include "SpscQueue.h"
@@ -20,6 +23,10 @@
 // behind every command submitted before it, so "everything submitted is
 // applied" falls out of the FIFO with no second synchronisation channel. After
 // Stop() returns the thread is joined and Book() may be inspected.
+//
+// The matching thread busy-waits, so it wants a core of its own: pass `core` to
+// pin it there (hard affinity on Linux; macOS reports Unsupported and the thread
+// merely asks for performance-core scheduling). Affinity() tells the outcome.
 class MatchingEngine
 {
 public:
@@ -28,7 +35,8 @@ public:
     using Commands = SpscQueue<Command, QueueCapacity>;
     using TradeQueue = SpscQueue<Trade, QueueCapacity>;
 
-    explicit MatchingEngine(OrderIndex capacity = Orderbook::DefaultCapacity);
+    explicit MatchingEngine(OrderIndex capacity = Orderbook::DefaultCapacity,
+                            std::optional<unsigned> core = std::nullopt);
 
     // The matching thread captures `this`.
     MatchingEngine(const MatchingEngine &) = delete;
@@ -52,6 +60,10 @@ public:
     // Only after Stop(): while the thread runs, the book is its alone.
     [[nodiscard]] const Orderbook &Book() const noexcept;
 
+    // Outcome of the pin request: a value when pinned (or when no core was asked
+    // for), otherwise why the OS declined.
+    [[nodiscard]] std::expected<void, AffinityError> Affinity() const noexcept { return affinity_; }
+
 private:
     void Run();
     void Apply(const Command &command, TradeSink onTrade);
@@ -59,6 +71,7 @@ private:
     Orderbook book_;
     Commands inbound_;
     TradeQueue outbound_;
+    std::expected<void, AffinityError> affinity_;
     // std::thread, not std::jthread: Apple Clang 17's libc++ (the README's floor)
     // lacks jthread, and nothing here needs it — Stop() joins explicitly and no
     // stop_token is ever requested. Last member: every member it reads is
