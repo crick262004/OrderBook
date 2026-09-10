@@ -42,7 +42,7 @@ one row per optimization commit, all measured on the same machine (±10% laptop 
 | `5b18318` | Single ownership: orders by value in level nodes, no `shared_ptr` | 45 / 43 / 44 | 150 / 152 / 204 |
 | `f6bf84b` | Arena: pooled orders, index handles, flat id→slot lookup | 23 / 25 / 26 | 134 / 136 / 148 |
 | `927f6c4` | Flat levels: sorted price arrays with the touch at the back, aggregates on the level, no `std::map`/hash | 22 / 25 / 29 | 57 / 60 / 61 |
-| _pending_ | Intrusive FIFO: orders are their own queue nodes, linked through pool slots; no `std::list`, zero per-order allocation | 14 / 15 / 21 | 34 / 37 / 40 |
+| `3a981ec` | Intrusive FIFO: orders are their own queue nodes, linked through pool slots; no `std::list`, zero per-order allocation | 14 / 15 / 21 | 34 / 37 / 40 |
 
 The bench replaces global `operator new` and reports heap allocations per iteration as an
 `allocs` counter: add + cancel is `allocs=0`; match + replenish is `allocs=1` — the returned
