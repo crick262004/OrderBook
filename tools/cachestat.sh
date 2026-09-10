@@ -18,6 +18,8 @@
 # Usage:  tools/cachestat.sh [--iterations N] [commit...]
 #         default commits: the optimization commits from the README table + HEAD
 # Output: a Markdown table on stdout (appended to $GITHUB_STEP_SUMMARY when set).
+#         Any build, valgrind or parse failure aborts with that tool's log: an
+#         empty cell is never silently produced.
 # Env:    CACHESTAT_SKIP_VALGRIND=1 runs the bench natively for a pipeline smoke test
 #         (misses print as n/a) — the only way to exercise this on macOS.
 set -euo pipefail
@@ -53,10 +55,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SKIP_VALGRIND=${CACHESTAT_SKIP_VALGRIND:-0}
-if [[ $SKIP_VALGRIND != 1 ]] && ! command -v valgrind >/dev/null; then
-    echo "valgrind not found (set CACHESTAT_SKIP_VALGRIND=1 for a pipeline smoke test)" >&2
+die() { # $1 = message, $2 = log file to show
+    echo "cachestat: $1" >&2
+    if [[ -n ${2:-} && -f $2 ]]; then
+        echo "--- $2 (tail) ---" >&2
+        tail -n 40 "$2" >&2
+    fi
     exit 1
+}
+
+SKIP_VALGRIND=${CACHESTAT_SKIP_VALGRIND:-0}
+if [[ $SKIP_VALGRIND != 1 ]]; then
+    command -v valgrind >/dev/null || die "valgrind not found (CACHESTAT_SKIP_VALGRIND=1 for a pipeline smoke test)"
+    valgrind --version >&2
 fi
 
 # Fixed cache geometry so the simulation is identical on every host: a generic
@@ -71,38 +82,49 @@ if command -v perf >/dev/null &&
     PERF_OK=1
 fi
 
-build() { # $1 = commit -> prints the bench binary path
-    local dir="$WORK/$1"
-    git -C "$ROOT" worktree add --detach --quiet "$dir" "$1"
-    cmake -S "$dir" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release \
-        -DFETCHCONTENT_BASE_DIR="$WORK/deps" >/dev/null
-    cmake --build "$dir/build" --target orderbook_bench --parallel >/dev/null
-    echo "$dir/build/OrderbookBench/orderbook_bench"
+bench_args() { # $1 = benchmark name
+    echo "--benchmark_filter=^$1/1000\$ --benchmark_min_time=${ITERATIONS}x --benchmark_min_warmup_time=0"
 }
 
-# Misses per iteration for one benchmark: "<L1D> <LL>" or "n/a n/a".
+build() { # $1 = commit -> prints the bench binary path; dies with the build log on failure
+    local dir="$WORK/$1" log="$WORK/build.$1.log"
+    git -C "$ROOT" worktree add --detach --quiet "$dir" "$1" || die "worktree for $1 failed"
+    cmake -S "$dir" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release \
+        -DFETCHCONTENT_BASE_DIR="$WORK/deps" >"$log" 2>&1 || die "configure of $1 failed" "$log"
+    cmake --build "$dir/build" --target orderbook_bench --parallel >>"$log" 2>&1 || die "build of $1 failed" "$log"
+    local bin="$dir/build/OrderbookBench/orderbook_bench"
+    [[ -x $bin ]] || die "no bench binary at $bin after building $1" "$log"
+    echo "$bin"
+}
+
+# Misses per iteration for one benchmark: "<L1D> <LL>" (or "n/a n/a" in smoke mode).
 simulate() { # $1 = bench binary, $2 = benchmark name
+    local log="$WORK/run.$2.log" out="$WORK/callgrind.$2.out"
+    # shellcheck disable=SC2046
     if [[ $SKIP_VALGRIND == 1 ]]; then
-        "$1" --benchmark_filter="^$2/1000\$" --benchmark_min_time="${ITERATIONS}x" \
-            --benchmark_min_warmup_time=0 >/dev/null 2>&1
+        "$1" $(bench_args "$2") >"$log" 2>&1 || die "bench $2 failed" "$log"
         echo "n/a n/a"
         return
     fi
-    local out="$WORK/callgrind.$2.out"
-    # Collect only inside the benchmark function: the harness and the depth-1000
-    # fill are excluded except for that fill, which is inside the function too
-    # and worth ~2% of the iterations — small, constant across commits.
+    # Collect only inside the benchmark function: the harness is excluded. The
+    # depth-1000 fill is inside the function too — ~2% of the iterations, the
+    # same on every commit.
     valgrind --tool=callgrind --cache-sim=yes "${CACHE[@]}" --collect-atstart=no \
         "--toggle-collect=*$2*" --callgrind-out-file="$out" \
-        "$1" --benchmark_filter="^$2/1000\$" --benchmark_min_time="${ITERATIONS}x" \
-        --benchmark_min_warmup_time=0 >/dev/null 2>&1
-    # The callgrind file names its event columns once and totals them once.
-    awk -v n="$ITERATIONS" '
+        "$1" $(bench_args "$2") >"$log" 2>&1 || die "valgrind on $2 failed" "$log"
+    [[ -s $out ]] || die "valgrind wrote no callgrind file for $2" "$log"
+    # The callgrind file names its event columns once ("events:") and totals them
+    # once ("summary:" in the header or "totals:" at the end).
+    local parsed
+    parsed=$(awk -v n="$ITERATIONS" '
         /^events:/ { for (i = 2; i <= NF; i++) idx[$i] = i - 1 }
-        /^summary:/ {
+        /^(summary|totals):/ {
             for (i = 2; i <= NF; i++) v[i - 1] = $i
             printf "%.3f %.4f\n", (v[idx["D1mr"]] + v[idx["D1mw"]]) / n, (v[idx["DLmr"]] + v[idx["DLmw"]]) / n
-        }' "$out"
+            exit
+        }' "$out")
+    [[ -n $parsed ]] || die "could not parse events/summary in $out" "$out"
+    echo "$parsed"
 }
 
 # Hardware L1D load misses per iteration for the whole process (setup included), or n/a.
@@ -111,25 +133,38 @@ hardware() { # $1 = bench binary, $2 = benchmark name
         echo "n/a"
         return
     fi
-    perf stat -x, -e L1-dcache-load-misses \
-        "$1" --benchmark_filter="^$2/1000\$" --benchmark_min_time="${ITERATIONS}x" \
-        --benchmark_min_warmup_time=0 2>&1 >/dev/null |
+    # shellcheck disable=SC2046
+    perf stat -x, -e L1-dcache-load-misses "$1" $(bench_args "$2") 2>&1 >/dev/null |
         awk -F, -v n="$ITERATIONS" '/L1-dcache-load-misses/ { printf "%.3f\n", $1 / n }'
 }
 
+TABLE="$WORK/table.md"
 {
     echo "| Commit | Change | L1D misses / add+cancel | L1D misses / match | LL misses / match | perf L1D / match (whole process) |"
     echo "|---|---|---|---|---|---|"
-    for c in "${COMMITS[@]}"; do
-        hash=$(git -C "$ROOT" rev-parse --short "$c")
-        subject=$(git -C "$ROOT" log -1 --format=%s "$c")
-        bench=$(build "$c")
-        read -r addL1 _ <<<"$(simulate "$bench" BM_AddCancel)"
-        read -r matchL1 matchLL <<<"$(simulate "$bench" BM_AddMatch)"
-        hw=$(hardware "$bench" BM_AddMatch)
-        echo "| \`$hash\` | $subject | $addL1 | $matchL1 | $matchLL | $hw |"
-    done
+} >"$TABLE"
+
+# Plain loop, not a pipeline: set -e must stay in force so a failed build or run aborts.
+for c in "${COMMITS[@]}"; do
+    hash=$(git -C "$ROOT" rev-parse --short "$c")
+    subject=$(git -C "$ROOT" log -1 --format=%s "$c")
+    echo "cachestat: $hash $subject" >&2
+    bench=$(build "$c") || exit 1
+    add=$(simulate "$bench" BM_AddCancel) || exit 1
+    match=$(simulate "$bench" BM_AddMatch) || exit 1
+    hw=$(hardware "$bench" BM_AddMatch)
+    read -r addL1 _ <<<"$add"
+    read -r matchL1 matchLL <<<"$match"
+    echo "| \`$hash\` | $subject | $addL1 | $matchL1 | $matchLL | $hw |" >>"$TABLE"
+done
+
+{
     echo
     echo "callgrind --cache-sim=yes, ${CACHE[*]}, ${ITERATIONS} iterations per benchmark at depth 1000;"
     echo "misses counted only inside the benchmark function. perf column requires an exposed PMU."
-} | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+} >>"$TABLE"
+
+cat "$TABLE"
+if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+    cat "$TABLE" >>"$GITHUB_STEP_SUMMARY"
+fi

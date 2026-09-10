@@ -33,7 +33,23 @@
 // own lines too: a note scribbled next to tail_ would shred the consumer's copy
 // of tail_ for nothing. CounterAlignment is a template parameter so the packed
 // layout stays available as the A/B control in the benchmarks.
-template <typename T, std::size_t Capacity, std::size_t CounterAlignment = std::hardware_destructive_interference_size>
+
+// The alignment that keeps two objects off each other's cache line, taken from
+// the standard constant exactly once. GCC warns on every use of that constant
+// (-Winterference-size): its value depends on the CPU tuning flags, so baking it
+// into a public ABI is unsafe. This project is one binary built with one set of
+// flags, so the warning is silenced for this one definition and every other use
+// goes through this name (64 on x86 GCC, 256 on arm64 clang/GCC; the M5's line is 128).
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winterference-size"
+#endif
+inline constexpr std::size_t DestructiveInterferenceSize = std::hardware_destructive_interference_size;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+template <typename T, std::size_t Capacity, std::size_t CounterAlignment = DestructiveInterferenceSize>
 class SpscQueue
 {
     static_assert(std::has_single_bit(Capacity), "capacity must be a power of two: slot = counter & mask");
