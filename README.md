@@ -46,7 +46,7 @@ one row per optimization commit, all measured on the same machine (±10% laptop 
 | `f6bf84b` | Arena: pooled orders, index handles, flat id→slot lookup | 23 / 25 / 26 | 134 / 136 / 148 |
 | `927f6c4` | Flat levels: sorted price arrays with the touch at the back, aggregates on the level, no `std::map`/hash | 22 / 25 / 29 | 57 / 60 / 61 |
 | `3a981ec` | Intrusive FIFO: orders are their own queue nodes, linked through pool slots; no `std::list`, zero per-order allocation | 14 / 15 / 21 | 34 / 37 / 40 |
-| `TBD` | Trade sink: fills go to a 16-byte `function_ref` callback instead of a returned `std::vector<Trade>`; the last allocation is gone | 13 / 15 / 23 | 23 / 28 / 34 |
+| `a24ee1f` | Trade sink: fills go to a 16-byte `function_ref` callback instead of a returned `std::vector<Trade>`; the last allocation is gone | 13 / 15 / 23 | 23 / 28 / 34 |
 
 The bench replaces global `operator new` and reports heap allocations per iteration as an
 `allocs` counter. Since the trade sink it reads `allocs=0` on every benchmark: the book
