@@ -1,9 +1,11 @@
+#include <atomic>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -687,11 +689,36 @@ TEST(FunctionRefTest, InvokesTheBorrowedCallableWithItsCaptures)
     EXPECT_EQ(total, 12u);
 }
 
-// The ring, single-threaded first: FIFO order, full and empty reported exactly,
-// and the mask wrapping the counters back over the same slots.
-TEST(SpscQueueTest, PushPopIsFifoAndReportsFullAndEmpty)
+// The ring's two counter layouts — padded (one cache line per counter, the
+// default) and packed (the A/B control) — must behave identically; only their
+// cache traffic differs. Every ring test runs against both.
+template <std::size_t CounterAlignment>
+struct RingLayout
 {
-    SpscQueue<std::uint64_t, 4> queue;
+    template <std::size_t Capacity>
+    using Queue = SpscQueue<std::uint64_t, Capacity, CounterAlignment>;
+};
+
+using RingLayouts = testing::Types<RingLayout<std::hardware_destructive_interference_size>,
+                                   RingLayout<alignof(std::atomic<std::uint64_t>)>>;
+
+template <typename Layout>
+class SpscQueueTest : public testing::Test
+{
+};
+
+TYPED_TEST_SUITE(SpscQueueTest, RingLayouts);
+
+// The padded layout really does spread the four counters over four lines.
+static_assert(alignof(SpscQueue<std::uint64_t, 4>) == std::hardware_destructive_interference_size);
+static_assert(sizeof(SpscQueue<std::uint64_t, 4>) >= 4 * std::hardware_destructive_interference_size);
+
+// Single-threaded first: FIFO order, full and empty reported exactly, the mask
+// wrapping the counters back over the same slots, and the private peer copies
+// going stale (full, then drained; empty, then refilled) and refreshing.
+TYPED_TEST(SpscQueueTest, PushPopIsFifoAndReportsFullAndEmpty)
+{
+    typename TypeParam::template Queue<4> queue;
     EXPECT_TRUE(queue.Empty());
     EXPECT_EQ(queue.Front(), nullptr);
 
@@ -724,10 +751,10 @@ TEST(SpscQueueTest, PushPopIsFifoAndReportsFullAndEmpty)
 
 // Two threads, a ring far smaller than the sequence so it fills and wraps
 // thousands of times: every element must arrive exactly once, in order.
-TEST(SpscQueueTest, DeliversTheWholeSequenceInOrderAcrossThreads)
+TYPED_TEST(SpscQueueTest, DeliversTheWholeSequenceInOrderAcrossThreads)
 {
     constexpr std::uint64_t Count = 200'000;
-    SpscQueue<std::uint64_t, 8> queue;
+    typename TypeParam::template Queue<8> queue;
 
     std::thread producer{[&queue]
                          {

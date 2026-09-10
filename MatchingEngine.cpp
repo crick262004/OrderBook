@@ -23,7 +23,7 @@ void MatchingEngine::Submit(const Command &command) noexcept
     }
 }
 
-const Trade *MatchingEngine::NextTrade() const noexcept
+const Trade *MatchingEngine::NextTrade() noexcept
 {
     return outbound_.Front();
 }

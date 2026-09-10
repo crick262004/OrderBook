@@ -43,7 +43,7 @@ public:
     void Submit(const Command &command) noexcept;
 
     // Reporting side (one thread), zero-copy: read the trade, then PopTrade.
-    [[nodiscard]] const Trade *NextTrade() const noexcept;
+    [[nodiscard]] const Trade *NextTrade() noexcept;
     void PopTrade() noexcept;
 
     // Pushes the poison pill and joins the matching thread. Idempotent.

@@ -47,6 +47,7 @@ one row per optimization commit, all measured on the same machine (±10% laptop 
 | `927f6c4` | Flat levels: sorted price arrays with the touch at the back, aggregates on the level, no `std::map`/hash | 22 / 25 / 29 | 57 / 60 / 61 |
 | `3a981ec` | Intrusive FIFO: orders are their own queue nodes, linked through pool slots; no `std::list`, zero per-order allocation | 14 / 15 / 21 | 34 / 37 / 40 |
 | `a24ee1f` | Trade sink: fills go to a 16-byte `function_ref` callback instead of a returned `std::vector<Trade>`; the last allocation is gone | 13 / 15 / 23 | 23 / 28 / 34 |
+| `TBD` | Padded ring counters: one cache line per SPSC counter plus a cached copy of the peer's, no false sharing (book untouched; see the threading table) | 12 / 15 / 19 | 23 / 30 / 32 |
 
 The bench replaces global `operator new` and reports heap allocations per iteration as an
 `allocs` counter. Since the trade sink it reads `allocs=0` on every benchmark: the book
@@ -54,17 +55,22 @@ allocates only at construction.
 
 ### Threading
 
-The same commit adds `MatchingEngine`: the book runs on its own thread and the rest of the
-program talks to it through two single-producer/single-consumer rings — commands in, trades
-out. The book gained no thread-aware code at all (single-writer principle); the boundary is
-where concurrency lives. Instruments for the upcoming pinning and cache-line-alignment
-commits (unpinned, ring counters sharing a cache line):
+`MatchingEngine` runs the book on its own thread; the rest of the program talks to it through
+two single-producer/single-consumer rings — commands in, trades out. The book gained no
+thread-aware code at all (single-writer principle); the boundary is where concurrency lives.
 
-| Benchmark | What it measures | ns |
-|---|---|---|
-| `BM_SpscPushPop` | one thread: push + front + pop on the ring (the acquire/release floor) | 1.8 |
-| `BM_SpscPingPong` | two threads, two rings: one round trip = two cross-core hand-offs | 269 |
-| `BM_EngineRoundTrip/1000` | order submitted → trade read back out, through the engine, depth 1,000 | 285 |
+| Benchmark | What it measures | `a24ee1f` | padded counters |
+|---|---|---|---|
+| `BM_SpscPushPop` | one thread: push + front + pop on the ring (the acquire/release floor) | 1.8 | 2.0 |
+| `BM_SpscPingPong` | two threads, two rings: one round trip = two cross-core hand-offs | 269 | **121** |
+| `BM_SpscPingPong/packed` | the same code with all four ring counters on one cache line (A/B control) | — | 231 |
+| `BM_SpscPingPongTail` | per-iteration timing of the round trip: p50 / p99 / max | — | 167 / 208 / ~20,000 |
+| `BM_EngineRoundTrip/1000` | order submitted → trade read back out, through the engine, depth 1,000 | 285 | **161** |
+
+The padded/packed pair is the false-sharing measurement: same code, same run, only the
+layout differs, so the 110 ns gap is the tax of two writers sharing a cache line. The
+~20 µs max in both layouts is OS preemption of an unpinned spinning thread — the number
+thread pinning targets.
 
 ## License
 

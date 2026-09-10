@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <type_traits>
 
 // Bounded lock-free single-producer / single-consumer ring. Exactly one thread
@@ -19,13 +20,26 @@
 // head_ and tail_ are monotonically increasing 64-bit counters (a wrap would
 // take centuries at 1 G ops/s): the slot is the counter masked by Capacity - 1
 // and occupancy is tail_ - head_, so full and empty are unambiguous and every
-// slot is usable. The two counters deliberately share a cache line for now —
-// roadmap 3.3 splits them (false sharing) and measures the difference.
-template <typename T, std::size_t Capacity>
+// slot is usable.
+//
+// Layout (3.3): four counters on four cache lines. A write to a line invalidates
+// every other core's copy of it, so two writers sharing a line — the producer's
+// tail_ next to the consumer's head_ — made each side miss on its *own* counter
+// after every operation of the other (false sharing). With one writer per line,
+// tail_'s line travels producer -> consumer once per publish and never comes
+// back. Each side also keeps a private copy of the peer's counter and re-reads
+// the shared line only when that copy says full/empty, so a burst of N pushes
+// touches the consumer's line once, not N times. The private copies get their
+// own lines too: a note scribbled next to tail_ would shred the consumer's copy
+// of tail_ for nothing. CounterAlignment is a template parameter so the packed
+// layout stays available as the A/B control in the benchmarks.
+template <typename T, std::size_t Capacity, std::size_t CounterAlignment = std::hardware_destructive_interference_size>
 class SpscQueue
 {
     static_assert(std::has_single_bit(Capacity), "capacity must be a power of two: slot = counter & mask");
     static_assert(std::is_trivially_copyable_v<T>, "items are copied into and read out of raw slots by value");
+    static_assert(std::has_single_bit(CounterAlignment) && CounterAlignment >= alignof(std::atomic<std::uint64_t>),
+                  "counter alignment must be a power of two no smaller than the counter itself");
 
 public:
     SpscQueue() : cells_{std::make_unique<Cell[]>(Capacity)} {}
@@ -44,12 +58,17 @@ public:
         // Own counter: nobody else writes it, so no ordering is needed to read it.
         const auto tail = tail_.load(std::memory_order_relaxed);
 
-        // Acquire pairs with the consumer's release in Pop: the consumer's read
-        // of the slot we are about to overwrite is complete before we touch it.
-        // A stale head_ only errs toward "full" — it never increases.
-        if (tail - head_.load(std::memory_order_acquire) == Capacity)
+        // The private copy of head_ is a lower bound (head_ only grows), so
+        // "not full" by the copy is safe. Only when it says full do we touch the
+        // consumer's line. Acquire pairs with the consumer's release in Pop: its
+        // read of the slot we are about to overwrite is complete before we do.
+        if (tail - cachedHead_ == Capacity)
         {
-            return false;
+            cachedHead_ = head_.load(std::memory_order_acquire);
+            if (tail - cachedHead_ == Capacity)
+            {
+                return false;
+            }
         }
 
         std::construct_at(std::addressof(cells_[tail & Mask].value_), item);
@@ -61,16 +80,22 @@ public:
 
     // Consumer side, zero-copy: Front exposes the oldest item in place (nullptr
     // when empty), Pop releases its slot. Use the item, *then* Pop — after Pop
-    // the producer may overwrite it.
-    [[nodiscard]] const T *Front() const noexcept
+    // the producer may overwrite it. Non-const: it refreshes the consumer's
+    // private copy of tail_.
+    [[nodiscard]] const T *Front() noexcept
     {
         const auto head = head_.load(std::memory_order_relaxed);
 
-        // Acquire pairs with the producer's release in TryPush: the item's bytes
-        // are visible before we read them.
-        if (tail_.load(std::memory_order_acquire) == head)
+        // Mirror of TryPush: the copy of tail_ is a lower bound, so anything it
+        // says is published really is (the acquire that fetched it ordered those
+        // items before us). Only an apparently empty ring re-reads the shared line.
+        if (cachedTail_ == head)
         {
-            return nullptr;
+            cachedTail_ = tail_.load(std::memory_order_acquire);
+            if (cachedTail_ == head)
+            {
+                return nullptr;
+            }
         }
 
         return std::addressof(cells_[head & Mask].value_);
@@ -80,7 +105,7 @@ public:
     void Pop() noexcept
     {
         const auto head = head_.load(std::memory_order_relaxed);
-        assert(head != tail_.load(std::memory_order_relaxed));
+        assert(head != cachedTail_);
 
         // Release: our read of the slot happens-before the producer's next write to it.
         head_.store(head + 1, std::memory_order_release);
@@ -115,7 +140,15 @@ private:
         Cell &operator=(Cell &&) = delete;
     };
 
+    // Read by both sides, written by neither after construction: sharing is free.
     std::unique_ptr<Cell[]> cells_;
-    std::atomic<std::uint64_t> head_{0}; // next slot to read; written by the consumer only
-    std::atomic<std::uint64_t> tail_{0}; // next slot to write; written by the producer only
+
+    // Producer's lines: its counter (read remotely by the consumer) and its
+    // private copy of the consumer's counter.
+    alignas(CounterAlignment) std::atomic<std::uint64_t> tail_{0};
+    alignas(CounterAlignment) std::uint64_t cachedHead_{0};
+
+    // Consumer's lines: mirror image.
+    alignas(CounterAlignment) std::atomic<std::uint64_t> head_{0};
+    alignas(CounterAlignment) std::uint64_t cachedTail_{0};
 };

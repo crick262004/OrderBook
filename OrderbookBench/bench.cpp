@@ -1,10 +1,13 @@
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <new>
 #include <thread>
+#include <vector>
 
 #include <benchmark/benchmark.h>
 
@@ -173,56 +176,118 @@ void BM_SpscPushPop(benchmark::State &state)
     }
 }
 
-// Two threads, two rings: this thread pushes a request, the echo thread pops it
-// and pushes it back, this thread waits for the reply. One iteration is one
-// round trip = two cross-core hand-offs, i.e. twice the cache-line transfer
-// latency between whichever cores the OS picked (3.2 pins them) plus the
-// counters' false-sharing tax (3.3 removes it).
-void BM_SpscPingPong(benchmark::State &state)
+// The A/B pair for false sharing: the default layout gives each ring counter its
+// own cache line; the packed control puts all four on one line, as 3.1 had them.
+// Same code, same run, only the layout differs, so the delta is the false-sharing tax.
+using PaddedRing = SpscQueue<std::uint64_t, 1024>;
+using PackedRing = SpscQueue<std::uint64_t, 1024, alignof(std::atomic<std::uint64_t>)>;
+
+constexpr std::uint64_t Poison = 0;
+
+// Echo thread: pops each request and pushes it straight back; exits on Poison.
+template <typename Ring>
+std::thread StartEcho(Ring &request, Ring &response)
 {
-    constexpr std::uint64_t Poison = 0;
-    SpscQueue<std::uint64_t, 1024> request;
-    SpscQueue<std::uint64_t, 1024> response;
+    return std::thread{[&request, &response]
+                       {
+                           for (;;)
+                           {
+                               const std::uint64_t *item = nullptr;
+                               while ((item = request.Front()) == nullptr)
+                               {
+                               }
+                               const auto value = *item;
+                               request.Pop();
+                               if (value == Poison)
+                               {
+                                   return;
+                               }
+                               while (!response.TryPush(value))
+                               {
+                               }
+                           }
+                       }};
+}
 
-    std::thread echo{[&request, &response]
-                     {
-                         for (;;)
-                         {
-                             const std::uint64_t *item = nullptr;
-                             while ((item = request.Front()) == nullptr)
-                             {
-                             }
-                             const auto value = *item;
-                             request.Pop();
-                             if (value == Poison)
-                             {
-                                 return;
-                             }
-                             while (!response.TryPush(value))
-                             {
-                             }
-                         }
-                     }};
-
-    const AllocationScope allocations{state};
-    for (auto _ : state)
+template <typename Ring>
+void RoundTrip(Ring &request, Ring &response)
+{
+    while (!request.TryPush(1))
     {
-        while (!request.TryPush(1))
-        {
-        }
-        const std::uint64_t *reply = nullptr;
-        while ((reply = response.Front()) == nullptr)
-        {
-        }
-        auto value = *reply;
-        benchmark::DoNotOptimize(value);
-        response.Pop();
     }
+    const std::uint64_t *reply = nullptr;
+    while ((reply = response.Front()) == nullptr)
+    {
+    }
+    auto value = *reply;
+    benchmark::DoNotOptimize(value);
+    response.Pop();
+}
 
+template <typename Ring>
+void StopEcho(Ring &request, std::thread &echo)
+{
     while (!request.TryPush(Poison))
     {
     }
     echo.join();
+}
+
+// Two threads, two rings: this thread pushes a request, the echo thread pops it
+// and pushes it back, this thread waits for the reply. One iteration is one
+// round trip = two cross-core hand-offs, i.e. twice the cache-line transfer
+// latency between whichever cores the OS picked (3.2 pins them) plus, for the
+// packed control, the counters' false-sharing tax.
+template <typename Ring>
+void BM_SpscPingPong(benchmark::State &state)
+{
+    Ring request;
+    Ring response;
+    std::thread echo = StartEcho(request, response);
+
+    const AllocationScope allocations{state};
+    for (auto _ : state)
+    {
+        RoundTrip(request, response);
+    }
+
+    StopEcho(request, echo);
+}
+
+// The same round trip with every iteration timed individually, so the tail is
+// visible: pinning and layout move p99 and max far more than the mean. The two
+// clock reads add ~20 ns per iteration, so compare p50 here with the mean above.
+template <typename Ring>
+void BM_SpscPingPongTail(benchmark::State &state)
+{
+    Ring request;
+    Ring response;
+    // Sized before the allocation scope: the samples are harness, not ring.
+    std::vector<std::int64_t> samples(static_cast<std::size_t>(state.max_iterations));
+    std::thread echo = StartEcho(request, response);
+
+    std::size_t count = 0;
+    {
+        // Scoped to the timed loop: the percentile counters set below are
+        // harness bookkeeping that allocates map nodes, not ring traffic.
+        const AllocationScope allocations{state};
+        for (auto _ : state)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            RoundTrip(request, response);
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            samples[count++] = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+        }
+    }
+
+    StopEcho(request, echo);
+
+    std::sort(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(count));
+    const auto percentile = [&](std::size_t hundredths)
+    { return static_cast<double>(samples[std::min(count - 1, count * hundredths / 100)]); };
+    state.counters["p50_ns"] = percentile(50);
+    state.counters["p99_ns"] = percentile(99);
+    state.counters["max_ns"] = static_cast<double>(samples[count - 1]);
 }
 
 // End to end through the engine: submit a crossing sell, wait for its trade to
@@ -261,7 +326,10 @@ void BM_EngineRoundTrip(benchmark::State &state)
 BENCHMARK(BM_AddCancel)->RangeMultiplier(10)->Range(100, 10'000);
 BENCHMARK(BM_AddMatch)->RangeMultiplier(10)->Range(100, 10'000);
 BENCHMARK(BM_SpscPushPop);
-BENCHMARK(BM_SpscPingPong)->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPong, PaddedRing)->Name("BM_SpscPingPong/padded")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPong, PackedRing)->Name("BM_SpscPingPong/packed")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPongTail, PaddedRing)->Name("BM_SpscPingPongTail/padded")->UseRealTime();
+BENCHMARK_TEMPLATE(BM_SpscPingPongTail, PackedRing)->Name("BM_SpscPingPongTail/packed")->UseRealTime();
 BENCHMARK(BM_EngineRoundTrip)->Arg(1'000)->UseRealTime();
 
 } // namespace
