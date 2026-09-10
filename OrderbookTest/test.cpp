@@ -443,7 +443,6 @@ TEST(PriceLevelsTest, FindOrCreateReturnsTheExistingLevel)
     PriceLevels<std::greater<Price>> bids{4};
 
     auto &created = bids.FindOrCreate(100);
-    created.orders_.push_back(7);
     created.count_ = 1;
     created.quantity_ = 10;
 
@@ -451,7 +450,6 @@ TEST(PriceLevelsTest, FindOrCreateReturnsTheExistingLevel)
     EXPECT_EQ(bids.Size(), 1u);
     EXPECT_EQ(found.count_, 1u);
     EXPECT_EQ(found.quantity_, 10u);
-    EXPECT_EQ(found.orders_.front(), 7u);
 
     EXPECT_EQ(bids.Find(101), nullptr);
     ASSERT_NE(bids.Find(100), nullptr);
@@ -477,6 +475,100 @@ TEST(PriceLevelsTest, EraseMidArrayKeepsOrderAndGrowsPastReserve)
     EXPECT_EQ(asks.BestPrice(), 102);
     EXPECT_EQ(asks.WorstPrice(), 105);
     EXPECT_EQ(asks.Size(), 3u);
+}
+
+// The intrusive FIFO: resting orders are their own queue nodes, linked through
+// their pool slots. Tested against a pool and a bare Level.
+std::vector<OrderIndex> QueueFrontToBack(const OrderPool &pool, const Level &level)
+{
+    std::vector<OrderIndex> slots;
+    for (auto slot = level.head_; slot != Constants::InvalidIndex; slot = pool.Next(slot))
+    {
+        slots.push_back(slot);
+    }
+    return slots;
+}
+
+OrderIndex AllocResting(OrderPool &pool, OrderId orderId)
+{
+    return pool.Alloc(Order{OrderType::GoodTillCancel, orderId, Side::Buy, 100, 1});
+}
+
+TEST(LevelQueueTest, PushBackKeepsTimePriority)
+{
+    OrderPool pool{4};
+    Level level;
+    EXPECT_TRUE(level.Empty());
+
+    const auto first = AllocResting(pool, 0);
+    const auto second = AllocResting(pool, 1);
+    const auto third = AllocResting(pool, 2);
+    level.PushBack(pool, first);
+    level.PushBack(pool, second);
+    level.PushBack(pool, third);
+
+    EXPECT_FALSE(level.Empty());
+    EXPECT_EQ(level.head_, first);
+    EXPECT_EQ(level.tail_, third);
+    EXPECT_EQ(QueueFrontToBack(pool, level), (std::vector<OrderIndex>{first, second, third}));
+}
+
+TEST(LevelQueueTest, UnlinksHeadMiddleAndTailInPlace)
+{
+    OrderPool pool{4};
+    Level level;
+
+    const auto a = AllocResting(pool, 0);
+    const auto b = AllocResting(pool, 1);
+    const auto c = AllocResting(pool, 2);
+    const auto d = AllocResting(pool, 3);
+    for (const auto slot : {a, b, c, d})
+    {
+        level.PushBack(pool, slot);
+    }
+
+    // Middle: neighbours are re-stitched, the removed slot's links are reset.
+    level.Unlink(pool, b);
+    EXPECT_EQ(QueueFrontToBack(pool, level), (std::vector<OrderIndex>{a, c, d}));
+    EXPECT_EQ(pool.Prev(b), Constants::InvalidIndex);
+    EXPECT_EQ(pool.Next(b), Constants::InvalidIndex);
+
+    level.Unlink(pool, a); // head
+    EXPECT_EQ(level.head_, c);
+    EXPECT_EQ(QueueFrontToBack(pool, level), (std::vector<OrderIndex>{c, d}));
+
+    level.Unlink(pool, d); // tail
+    EXPECT_EQ(level.tail_, c);
+    EXPECT_EQ(QueueFrontToBack(pool, level), (std::vector<OrderIndex>{c}));
+
+    level.Unlink(pool, c); // last one out
+    EXPECT_TRUE(level.Empty());
+    EXPECT_EQ(level.tail_, Constants::InvalidIndex);
+}
+
+TEST(LevelQueueTest, UnlinkedSlotRecyclesWithoutDisturbingTheQueue)
+{
+    OrderPool pool{4};
+    Level level;
+
+    const auto a = AllocResting(pool, 0);
+    const auto b = AllocResting(pool, 1);
+    const auto c = AllocResting(pool, 2);
+    for (const auto slot : {a, b, c})
+    {
+        level.PushBack(pool, slot);
+    }
+
+    // Unlink, then Free: next_ becomes the free-list link only once the queue
+    // no longer needs it. LIFO reuse hands the same slot back.
+    level.Unlink(pool, b);
+    pool.Free(b);
+    const auto recycled = AllocResting(pool, 3);
+    EXPECT_EQ(recycled, b);
+
+    level.PushBack(pool, recycled);
+    EXPECT_EQ(QueueFrontToBack(pool, level), (std::vector<OrderIndex>{a, c, recycled}));
+    EXPECT_EQ(pool[recycled].GetOrderId(), 3u);
 }
 
 // Aggregates ride on the level: a snapshot must report the sum of remaining

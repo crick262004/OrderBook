@@ -3,26 +3,80 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
-#include <list>
 #include <ranges>
+#include <type_traits>
 #include <vector>
 
+#include "Constants.h"
+#include "OrderPool.h"
 #include "Usings.h"
 
-// Time-priority queue of one level: the pool slots of its resting orders, oldest
-// first. Its nodes are the last per-order heap allocation (gone in 2.2).
-using OrderList = std::list<OrderIndex>;
-
-// One price level. The aggregates live beside the queue so FOK checks, level
-// death and snapshots need no second lookup. quantity_ is the sum of remaining
-// quantity over orders_: every fill shrinks the order and the level by the same
-// amount.
+// One price level: its time-priority queue as head/tail slot indices — the
+// resting orders are the queue's nodes, linked through their own pool slots, so
+// queueing an order allocates nothing — plus the aggregates FOK checks, level
+// death and snapshots need. 16 bytes of scalars: relocating a level when the
+// array shifts is a memmove. quantity_ is the sum of remaining quantity over the
+// queue: every fill shrinks the order and the level by the same amount.
 struct Level
 {
     Quantity quantity_{};
     Quantity count_{};
-    OrderList orders_;
+    OrderIndex head_{Constants::InvalidIndex}; // oldest order: the next to match
+    OrderIndex tail_{Constants::InvalidIndex}; // youngest order
+
+    [[nodiscard]] bool Empty() const noexcept { return head_ == Constants::InvalidIndex; }
+
+    // Queue a slot at the back (time priority): O(1), touching only the old tail.
+    void PushBack(OrderPool &pool, OrderIndex slot) noexcept
+    {
+        pool.Prev(slot) = tail_;
+        pool.Next(slot) = Constants::InvalidIndex;
+
+        if (tail_ == Constants::InvalidIndex)
+        {
+            head_ = slot;
+        }
+        else
+        {
+            pool.Next(tail_) = slot;
+        }
+
+        tail_ = slot;
+    }
+
+    // Remove a slot from anywhere in the queue: O(1), no search, no iterator —
+    // the slot's own links say where it sits. Leaves the slot's links reset,
+    // the state OrderPool::Free requires.
+    void Unlink(OrderPool &pool, OrderIndex slot) noexcept
+    {
+        const OrderIndex prev = pool.Prev(slot);
+        const OrderIndex next = pool.Next(slot);
+
+        if (prev == Constants::InvalidIndex)
+        {
+            head_ = next;
+        }
+        else
+        {
+            pool.Next(prev) = next;
+        }
+
+        if (next == Constants::InvalidIndex)
+        {
+            tail_ = prev;
+        }
+        else
+        {
+            pool.Prev(next) = prev;
+        }
+
+        pool.Prev(slot) = Constants::InvalidIndex;
+        pool.Next(slot) = Constants::InvalidIndex;
+    }
 };
+
+static_assert(std::is_trivially_copyable_v<Level>, "level shifts in PriceLevels must be memmoves");
+static_assert(sizeof(Level) == 16, "four levels per 64-byte cache line");
 
 // The live levels of one side, contiguous and sorted worst -> best under Better
 // (std::greater<Price> for bids, std::less<Price> for asks), so the touch is
@@ -31,7 +85,7 @@ struct Level
 // (std::flat_map's layout): a binary search touches only the 4-byte price array
 // — 16 keys per cache line, L1-resident at tens of thousands of levels — and the
 // Level exactly once. A level born or dying away from the touch shifts every
-// better level (O(L) moves), a cost paid by that deep order alone.
+// better level (one memmove), a cost paid by that deep order alone.
 //
 // A Level reference stays valid until this side creates or erases a level.
 template <typename Better>

@@ -2,10 +2,9 @@
 
 #include <algorithm>
 #include <cassert>
-#include <iterator>
 
 Orderbook::Orderbook(OrderIndex capacity)
-    : bids_{LevelReserve}, asks_{LevelReserve}, pool_{capacity}, orders_(capacity)
+    : bids_{LevelReserve}, asks_{LevelReserve}, pool_{capacity}, orders_(capacity, Constants::InvalidIndex)
 {
 }
 
@@ -13,7 +12,7 @@ Trades Orderbook::AddOrder(Order order)
 {
     // Capacity contract: the id is the position in the flat index, so an id at
     // or beyond capacity is rejected exactly like a duplicate.
-    if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()].slot_ != Constants::InvalidIndex)
+    if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()] != Constants::InvalidIndex)
     {
         return {};
     }
@@ -83,51 +82,49 @@ void Orderbook::Rest(Levels &levels, OrderIndex slot)
     // FindOrCreate may shift this side's levels: take the reference after it and
     // hold none across it.
     Level &level = levels.FindOrCreate(order.GetPrice());
-    level.orders_.push_back(slot);
+    level.PushBack(pool_, slot);
     level.quantity_ += order.GetRemainingQuantity();
     ++level.count_;
 
-    orders_[order.GetOrderId()] = OrderEntry{slot, std::prev(level.orders_.end())};
+    orders_[order.GetOrderId()] = slot;
 }
 
 void Orderbook::CancelOrder(OrderId orderId)
 {
-    if (orderId >= orders_.size() || orders_[orderId].slot_ == Constants::InvalidIndex)
+    if (orderId >= orders_.size() || orders_[orderId] == Constants::InvalidIndex)
     {
         return;
     }
 
-    // Copy out, then destroy: the Order dies when its slot is freed, so
-    // everything bookkeeping needs is read before Free.
-    const auto [slot, location] = orders_[orderId];
-    const Order &order = pool_[slot];
-    const auto price = order.GetPrice();
-    const auto side = order.GetSide();
-    const auto remaining = order.GetRemainingQuantity();
+    const OrderIndex slot = orders_[orderId];
 
-    // Reset discipline: a removed id must read as not-live immediately, or a
-    // stale id would later reach a recycled slot holding a stranger's order.
-    orders_[orderId].slot_ = Constants::InvalidIndex;
-    pool_.Free(slot);
-
-    if (side == Side::Buy)
+    // Unlink before Free: Free repurposes the slot's next_ link for the free
+    // list, and the Order's price/side/remaining die with the slot.
+    if (pool_[slot].GetSide() == Side::Buy)
     {
-        Unrest(bids_, price, remaining, location);
+        Unrest(bids_, slot);
     }
     else
     {
-        Unrest(asks_, price, remaining, location);
+        Unrest(asks_, slot);
     }
+
+    // Reset discipline: a removed id must read as not-live immediately, or a
+    // stale id would later reach a recycled slot holding a stranger's order.
+    orders_[orderId] = Constants::InvalidIndex;
+    pool_.Free(slot);
 }
 
 template <typename Levels>
-void Orderbook::Unrest(Levels &levels, Price price, Quantity remaining, OrderList::iterator location)
+void Orderbook::Unrest(Levels &levels, OrderIndex slot)
 {
-    Level *const level = levels.Find(price);
+    const Order &order = pool_[slot];
+
+    Level *const level = levels.Find(order.GetPrice());
     assert(level != nullptr);
 
-    level->orders_.erase(location);
-    level->quantity_ -= remaining;
+    level->Unlink(pool_, slot);
+    level->quantity_ -= order.GetRemainingQuantity();
     if (--level->count_ == 0)
     {
         levels.Erase(*level);
@@ -145,7 +142,7 @@ void Orderbook::PruneGoodForDayOrders()
     // the once-per-day path, and it needs no auxiliary live-order structure.
     for (OrderId orderId = 0; orderId < orders_.size(); ++orderId)
     {
-        const auto slot = orders_[orderId].slot_;
+        const auto slot = orders_[orderId];
         if (slot != Constants::InvalidIndex && pool_[slot].GetOrderType() == OrderType::GoodForDay)
         {
             goodForDayIds.push_back(orderId);
@@ -162,12 +159,12 @@ void Orderbook::PruneGoodForDayOrders()
 
 Trades Orderbook::ModifyOrder(OrderModify order)
 {
-    if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()].slot_ == Constants::InvalidIndex)
+    if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()] == Constants::InvalidIndex)
     {
         return {};
     }
 
-    const auto orderType = pool_[orders_[order.GetOrderId()].slot_].GetOrderType();
+    const auto orderType = pool_[orders_[order.GetOrderId()]].GetOrderType();
 
     CancelOrder(order.GetOrderId());
     return AddOrder(order.ToOrder(orderType));
@@ -249,7 +246,7 @@ Trades Orderbook::MatchOrders(Side takerSide)
     // it is alone at its level: the front of its side's best level.
     const Level &takerLevel = takerSide == Side::Buy ? bids_.Best() : asks_.Best();
     const Level &makerLevel = takerSide == Side::Buy ? asks_.Best() : bids_.Best();
-    const Quantity takerQuantity = pool_[takerLevel.orders_.front()].GetRemainingQuantity();
+    const Quantity takerQuantity = pool_[takerLevel.head_].GetRemainingQuantity();
 
     Trades trades;
     // Common case: the taker is consumed within the best opposite level, so
@@ -264,13 +261,14 @@ Trades Orderbook::MatchOrders(Side takerSide)
         Level &bidLevel = bids_.Best();
         Level &askLevel = asks_.Best();
 
-        while (!bidLevel.orders_.empty() && !askLevel.orders_.empty())
+        while (!bidLevel.Empty() && !askLevel.Empty())
         {
-            const OrderIndex bidSlot = bidLevel.orders_.front();
-            const OrderIndex askSlot = askLevel.orders_.front();
+            const OrderIndex bidSlot = bidLevel.head_;
+            const OrderIndex askSlot = askLevel.head_;
 
             // References, never copies: Fill must shrink the order resting in the
             // pool, not a stack duplicate the loop would then re-read forever.
+            // One load each: the queue head IS the order's slot, no node hop.
             Order &bid = pool_[bidSlot];
             Order &ask = pool_[askSlot];
 
@@ -294,33 +292,34 @@ Trades Orderbook::MatchOrders(Side takerSide)
             bidLevel.quantity_ -= quantity;
             askLevel.quantity_ -= quantity;
 
-            // Free last: bid/ask reference the slots being released — nothing may
-            // read them after Free. Same reset discipline as CancelOrder: the id
-            // must stop reading as live before its slot can be recycled.
+            // Unlink, reset, Free — in that order: Unlink reads the slot's links
+            // that Free repurposes for the free list; the id must stop reading as
+            // live before its slot can be recycled; and bid/ask reference the
+            // slots being released, so nothing may read them after Free.
             if (bid.IsFilled())
             {
-                orders_[bid.GetOrderId()].slot_ = Constants::InvalidIndex;
-                pool_.Free(bidSlot);
-                bidLevel.orders_.pop_front();
+                bidLevel.Unlink(pool_, bidSlot);
                 --bidLevel.count_;
+                orders_[bid.GetOrderId()] = Constants::InvalidIndex;
+                pool_.Free(bidSlot);
             }
 
             if (ask.IsFilled())
             {
-                orders_[ask.GetOrderId()].slot_ = Constants::InvalidIndex;
-                pool_.Free(askSlot);
-                askLevel.orders_.pop_front();
+                askLevel.Unlink(pool_, askSlot);
                 --askLevel.count_;
+                orders_[ask.GetOrderId()] = Constants::InvalidIndex;
+                pool_.Free(askSlot);
             }
         }
 
         // An emptied level dies at the touch: one pop_back per side, no heap.
-        if (bidLevel.orders_.empty())
+        if (bidLevel.Empty())
         {
             bids_.PopBest();
         }
 
-        if (askLevel.orders_.empty())
+        if (askLevel.Empty())
         {
             asks_.PopBest();
         }
@@ -334,7 +333,7 @@ Trades Orderbook::MatchOrders(Side takerSide)
     if (!takerSideEmpty)
     {
         const Level &best = takerSide == Side::Buy ? bids_.Best() : asks_.Best();
-        const Order &remainder = pool_[best.orders_.front()];
+        const Order &remainder = pool_[best.head_];
         if (remainder.GetOrderType() == OrderType::FillAndKill)
         {
             CancelOrder(remainder.GetOrderId());
