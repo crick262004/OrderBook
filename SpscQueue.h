@@ -42,6 +42,12 @@ class SpscQueue
                   "counter alignment must be a power of two no smaller than the counter itself");
 
 public:
+    // The layout's counter alignment, for code that must agree with it (tests, the
+    // packed A/B control). GCC warns on every direct use of
+    // hardware_destructive_interference_size outside a template because its value
+    // is tuning-dependent; naming it once here keeps that decision in one place.
+    static constexpr std::size_t Alignment = CounterAlignment;
+
     SpscQueue() : cells_{std::make_unique<Cell[]>(Capacity)} {}
 
     // A ring with a live peer cannot be relocated behind its back.

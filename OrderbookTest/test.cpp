@@ -704,8 +704,8 @@ struct RingLayout
     using Queue = SpscQueue<std::uint64_t, Capacity, CounterAlignment>;
 };
 
-using RingLayouts = testing::Types<RingLayout<std::hardware_destructive_interference_size>,
-                                   RingLayout<alignof(std::atomic<std::uint64_t>)>>;
+using DefaultRing = SpscQueue<std::uint64_t, 4>;
+using RingLayouts = testing::Types<RingLayout<DefaultRing::Alignment>, RingLayout<alignof(std::atomic<std::uint64_t>)>>;
 
 template <typename Layout>
 class SpscQueueTest : public testing::Test
@@ -715,8 +715,9 @@ class SpscQueueTest : public testing::Test
 TYPED_TEST_SUITE(SpscQueueTest, RingLayouts);
 
 // The padded layout really does spread the four counters over four lines.
-static_assert(alignof(SpscQueue<std::uint64_t, 4>) == std::hardware_destructive_interference_size);
-static_assert(sizeof(SpscQueue<std::uint64_t, 4>) >= 4 * std::hardware_destructive_interference_size);
+static_assert(DefaultRing::Alignment >= 64);
+static_assert(alignof(DefaultRing) == DefaultRing::Alignment);
+static_assert(sizeof(DefaultRing) >= 4 * DefaultRing::Alignment);
 
 // Single-threaded first: FIFO order, full and empty reported exactly, the mask
 // wrapping the counters back over the same slots, and the private peer copies
