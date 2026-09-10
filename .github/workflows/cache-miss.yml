@@ -26,7 +26,10 @@ jobs:
           sudo apt-get install -y valgrind
           echo "CXX=g++-14" >> "$GITHUB_ENV"
 
+      # `shell: bash` runs with -o pipefail; the default `run:` shell does not, and
+      # would take tee's exit code, letting a dying script pass the job.
       - name: Measure # the script also appends its table to the job summary
+        shell: bash
         run: tools/cachestat.sh | tee cachestat.md
 
       - uses: actions/upload-artifact@v4

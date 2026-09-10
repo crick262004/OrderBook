@@ -59,7 +59,7 @@ die() { # $1 = message, $2 = log file to show
     echo "cachestat: $1" >&2
     if [[ -n ${2:-} && -f $2 ]]; then
         echo "--- $2 (tail) ---" >&2
-        tail -n 40 "$2" >&2
+        tail -n 80 "$2" >&2
     fi
     exit 1
 }
@@ -108,11 +108,15 @@ simulate() { # $1 = bench binary, $2 = benchmark name
     fi
     # Collect only inside the benchmark function: the harness is excluded. The
     # depth-1000 fill is inside the function too — ~2% of the iterations, the
-    # same on every commit.
-    valgrind --tool=callgrind --cache-sim=yes "${CACHE[@]}" --collect-atstart=no \
+    # same on every commit. -v and --trace-children make the log say what valgrind
+    # actually traced; a client that exec()s otherwise runs natively and silently.
+    valgrind -v --trace-children=yes --tool=callgrind --cache-sim=yes "${CACHE[@]}" --collect-atstart=no \
         "--toggle-collect=*$2*" --callgrind-out-file="$out" \
         "$1" $(bench_args "$2") >"$log" 2>&1 || die "valgrind on $2 failed" "$log"
-    [[ -s $out ]] || die "valgrind wrote no callgrind file for $2" "$log"
+    if [[ ! -s $out ]]; then
+        ls -la "$WORK" >&2
+        die "valgrind wrote no callgrind file for $2" "$log"
+    fi
     # The callgrind file names its event columns once ("events:") and totals them
     # once ("summary:" in the header or "totals:" at the end).
     local parsed
