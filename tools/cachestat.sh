@@ -4,16 +4,22 @@
 # Every number in the README's performance table is wall-clock; the claim behind
 # them is "fewer cache misses". This script measures the misses themselves. For
 # each commit it checks out a worktree, builds the Release benchmark, and runs
-# BM_AddCancel/1000 and BM_AddMatch/1000 for a fixed iteration count under
-# valgrind's cache simulator (callgrind --cache-sim=yes), collecting only while
-# the benchmark function runs, and reports data-cache misses per operation.
+# BM_AddCancel/1000 and BM_AddMatch/1000 under valgrind's cache simulator
+# (callgrind --cache-sim=yes), reporting instructions and data-cache misses per
+# operation.
 #
-# Simulation, deliberately: it is deterministic (the same binary gives the same
-# count to the digit) and runs anywhere Linux does, including a CI VM whose
-# hypervisor hides the PMU. What it cannot say is how long a miss took — no
-# prefetcher, no out-of-order overlap, no coherence traffic — so it proves
-# *fewer*, while the ns table proves *faster*. Hardware counters (`perf stat`)
-# are tried first and reported when the machine exposes them (bare metal).
+# Differential, deliberately: each benchmark runs twice, for N and 2N iterations,
+# and the per-operation cost is (second − first) / N. The simulation is
+# deterministic, so everything that does not scale with the iteration count —
+# the arena's construction (tens of MB zeroed), the depth-1000 fill, the
+# harness — cancels exactly. (A first attempt scoped collection to the benchmark
+# function instead; the constructor lives inside it and swamped the loop.)
+#
+# Simulation, deliberately too: it gives the same count to the digit every run
+# and works anywhere Linux does, including a CI VM whose hypervisor hides the
+# PMU. What it cannot say is how long a miss took — no prefetcher, no
+# out-of-order overlap, no coherence traffic — so it proves *fewer*, while the
+# ns table proves *faster*.
 #
 # Usage:  tools/cachestat.sh [--iterations N] [commit...]
 #         default commits: the optimization commits from the README table + HEAD
@@ -21,7 +27,7 @@
 #         Any build, valgrind or parse failure aborts with that tool's log: an
 #         empty cell is never silently produced.
 # Env:    CACHESTAT_SKIP_VALGRIND=1 runs the bench natively for a pipeline smoke test
-#         (misses print as n/a) — the only way to exercise this on macOS.
+#         (counts print as n/a) — the only way to exercise this on macOS.
 set -euo pipefail
 
 ITERATIONS=50000
@@ -59,7 +65,7 @@ die() { # $1 = message, $2 = log file to show
     echo "cachestat: $1" >&2
     if [[ -n ${2:-} && -f $2 ]]; then
         echo "--- $2 (tail) ---" >&2
-        tail -n 80 "$2" >&2
+        tail -n 60 "$2" >&2
     fi
     exit 1
 }
@@ -74,16 +80,8 @@ fi
 # server core — 32 KB 8-way L1D, 64-byte lines, 8 MB 16-way last level.
 CACHE=(--I1=32768,8,64 --D1=32768,8,64 --LL=8388608,16,64)
 
-# perf hardware events are usable only when the PMU is exposed (not in GitHub's VMs).
-PERF_OK=0
-if command -v perf >/dev/null &&
-    perf stat -e L1-dcache-load-misses true 2>&1 | grep -q "L1-dcache-load-misses" &&
-    ! perf stat -e L1-dcache-load-misses true 2>&1 | grep -q "not supported"; then
-    PERF_OK=1
-fi
-
-bench_args() { # $1 = benchmark name
-    echo "--benchmark_filter=^$1/1000\$ --benchmark_min_time=${ITERATIONS}x --benchmark_min_warmup_time=0"
+bench_args() { # $1 = benchmark name, $2 = iterations
+    echo "--benchmark_filter=^$1/1000\$ --benchmark_min_time=$2x --benchmark_min_warmup_time=0"
 }
 
 build() { # $1 = commit -> prints the bench binary path; dies with the build log on failure
@@ -97,55 +95,56 @@ build() { # $1 = commit -> prints the bench binary path; dies with the build log
     echo "$bin"
 }
 
-# Misses per iteration for one benchmark: "<L1D> <LL>" (or "n/a n/a" in smoke mode).
-simulate() { # $1 = bench binary, $2 = benchmark name
-    local log="$WORK/run.$2.log" out="$WORK/callgrind.$2.out"
+# Whole-run totals under the simulator: "Ir D1misses LLmisses" (reads + writes).
+totals() { # $1 = bench binary, $2 = benchmark name, $3 = iterations
+    local log="$WORK/run.$2.$3.log" out="$WORK/callgrind.$2.$3.out"
+    # --trace-children so a client that exec()s is still traced (without it the
+    # image runs natively and no file is ever written).
     # shellcheck disable=SC2046
-    if [[ $SKIP_VALGRIND == 1 ]]; then
-        "$1" $(bench_args "$2") >"$log" 2>&1 || die "bench $2 failed" "$log"
-        echo "n/a n/a"
-        return
-    fi
-    # Collect only inside the benchmark function: the harness is excluded. The
-    # depth-1000 fill is inside the function too — ~2% of the iterations, the
-    # same on every commit. -v and --trace-children make the log say what valgrind
-    # actually traced; a client that exec()s otherwise runs natively and silently.
-    valgrind -v --trace-children=yes --tool=callgrind --cache-sim=yes "${CACHE[@]}" --collect-atstart=no \
-        "--toggle-collect=*$2*" --callgrind-out-file="$out" \
-        "$1" $(bench_args "$2") >"$log" 2>&1 || die "valgrind on $2 failed" "$log"
+    valgrind --trace-children=yes --tool=callgrind --cache-sim=yes "${CACHE[@]}" \
+        --callgrind-out-file="$out" "$1" $(bench_args "$2" "$3") >"$log" 2>&1 ||
+        die "valgrind on $2 ($3 iterations) failed" "$log"
     if [[ ! -s $out ]]; then
         ls -la "$WORK" >&2
-        die "valgrind wrote no callgrind file for $2" "$log"
+        die "valgrind wrote no callgrind file for $2 ($3 iterations)" "$log"
     fi
     # The callgrind file names its event columns once ("events:") and totals them
     # once ("summary:" in the header or "totals:" at the end).
     local parsed
-    parsed=$(awk -v n="$ITERATIONS" '
+    parsed=$(awk '
         /^events:/ { for (i = 2; i <= NF; i++) idx[$i] = i - 1 }
         /^(summary|totals):/ {
             for (i = 2; i <= NF; i++) v[i - 1] = $i
-            printf "%.3f %.4f\n", (v[idx["D1mr"]] + v[idx["D1mw"]]) / n, (v[idx["DLmr"]] + v[idx["DLmw"]]) / n
+            print v[idx["Ir"]], v[idx["D1mr"]] + v[idx["D1mw"]], v[idx["DLmr"]] + v[idx["DLmw"]]
             exit
         }' "$out")
     [[ -n $parsed ]] || die "could not parse events/summary in $out" "$out"
     echo "$parsed"
 }
 
-# Hardware L1D load misses per iteration for the whole process (setup included), or n/a.
-hardware() { # $1 = bench binary, $2 = benchmark name
-    if [[ $PERF_OK != 1 ]]; then
-        echo "n/a"
+# Per-operation cost: "Ir D1 LL" as the difference between a 2N-iteration run and
+# an N-iteration run, divided by N. Everything constant cancels exactly.
+simulate() { # $1 = bench binary, $2 = benchmark name
+    if [[ $SKIP_VALGRIND == 1 ]]; then
+        local log="$WORK/run.$2.log"
+        # shellcheck disable=SC2046
+        "$1" $(bench_args "$2" "$ITERATIONS") >"$log" 2>&1 || die "bench $2 failed" "$log"
+        echo "n/a n/a n/a"
         return
     fi
-    # shellcheck disable=SC2046
-    perf stat -x, -e L1-dcache-load-misses "$1" $(bench_args "$2") 2>&1 >/dev/null |
-        awk -F, -v n="$ITERATIONS" '/L1-dcache-load-misses/ { printf "%.3f\n", $1 / n }'
+    local first second
+    first=$(totals "$1" "$2" "$ITERATIONS") || return 1
+    second=$(totals "$1" "$2" $((ITERATIONS * 2))) || return 1
+    awk -v n="$ITERATIONS" -v a="$first" -v b="$second" 'BEGIN {
+        split(a, x, " "); split(b, y, " ")
+        printf "%.1f %.3f %.4f\n", (y[1] - x[1]) / n, (y[2] - x[2]) / n, (y[3] - x[3]) / n
+    }'
 }
 
 TABLE="$WORK/table.md"
 {
-    echo "| Commit | Change | L1D misses / add+cancel | L1D misses / match | LL misses / match | perf L1D / match (whole process) |"
-    echo "|---|---|---|---|---|---|"
+    echo "| Commit | Change | instr / add+cancel | L1D misses / add+cancel | instr / match | L1D misses / match | LL misses / match |"
+    echo "|---|---|---|---|---|---|---|"
 } >"$TABLE"
 
 # Plain loop, not a pipeline: set -e must stay in force so a failed build or run aborts.
@@ -156,16 +155,15 @@ for c in "${COMMITS[@]}"; do
     bench=$(build "$c") || exit 1
     add=$(simulate "$bench" BM_AddCancel) || exit 1
     match=$(simulate "$bench" BM_AddMatch) || exit 1
-    hw=$(hardware "$bench" BM_AddMatch)
-    read -r addL1 _ <<<"$add"
-    read -r matchL1 matchLL <<<"$match"
-    echo "| \`$hash\` | $subject | $addL1 | $matchL1 | $matchLL | $hw |" >>"$TABLE"
+    read -r addIr addL1 _ <<<"$add"
+    read -r matchIr matchL1 matchLL <<<"$match"
+    echo "| \`$hash\` | $subject | $addIr | $addL1 | $matchIr | $matchL1 | $matchLL |" >>"$TABLE"
 done
 
 {
     echo
-    echo "callgrind --cache-sim=yes, ${CACHE[*]}, ${ITERATIONS} iterations per benchmark at depth 1000;"
-    echo "misses counted only inside the benchmark function. perf column requires an exposed PMU."
+    echo "callgrind --cache-sim=yes, ${CACHE[*]}; depth 1000; per-operation = (run of $((ITERATIONS * 2)) iterations − run of ${ITERATIONS}) / ${ITERATIONS},"
+    echo "so construction, fill and harness cancel exactly. Simulated counts: deterministic, no timing. Hardware counters need a PMU the CI VM does not expose."
 } >>"$TABLE"
 
 cat "$TABLE"
