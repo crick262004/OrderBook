@@ -184,25 +184,25 @@ void BM_SpscPingPong(benchmark::State &state)
     SpscQueue<std::uint64_t, 1024> request;
     SpscQueue<std::uint64_t, 1024> response;
 
-    std::jthread echo{[&request, &response]
-                      {
-                          for (;;)
-                          {
-                              const std::uint64_t *item = nullptr;
-                              while ((item = request.Front()) == nullptr)
-                              {
-                              }
-                              const auto value = *item;
-                              request.Pop();
-                              if (value == Poison)
-                              {
-                                  return;
-                              }
-                              while (!response.TryPush(value))
-                              {
-                              }
-                          }
-                      }};
+    std::thread echo{[&request, &response]
+                     {
+                         for (;;)
+                         {
+                             const std::uint64_t *item = nullptr;
+                             while ((item = request.Front()) == nullptr)
+                             {
+                             }
+                             const auto value = *item;
+                             request.Pop();
+                             if (value == Poison)
+                             {
+                                 return;
+                             }
+                             while (!response.TryPush(value))
+                             {
+                             }
+                         }
+                     }};
 
     const AllocationScope allocations{state};
     for (auto _ : state)
@@ -222,6 +222,7 @@ void BM_SpscPingPong(benchmark::State &state)
     while (!request.TryPush(Poison))
     {
     }
+    echo.join();
 }
 
 // End to end through the engine: submit a crossing sell, wait for its trade to

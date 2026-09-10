@@ -729,27 +729,31 @@ TEST(SpscQueueTest, DeliversTheWholeSequenceInOrderAcrossThreads)
     constexpr std::uint64_t Count = 200'000;
     SpscQueue<std::uint64_t, 8> queue;
 
-    std::jthread producer{[&queue]
-                          {
-                              for (std::uint64_t i = 0; i < Count; ++i)
-                              {
-                                  while (!queue.TryPush(i))
-                                  {
-                                  }
-                              }
-                          }};
+    std::thread producer{[&queue]
+                         {
+                             for (std::uint64_t i = 0; i < Count; ++i)
+                             {
+                                 while (!queue.TryPush(i))
+                                 {
+                                 }
+                             }
+                         }};
 
+    // Count mismatches instead of asserting mid-loop: an early return would leave
+    // the producer spinning on a full ring forever — a hang, not a failure.
+    std::uint64_t mismatches = 0;
     for (std::uint64_t expected = 0; expected < Count; ++expected)
     {
         const std::uint64_t *item = nullptr;
         while ((item = queue.Front()) == nullptr)
         {
         }
-        ASSERT_EQ(*item, expected);
+        mismatches += *item != expected ? 1 : 0;
         queue.Pop();
     }
 
     producer.join();
+    EXPECT_EQ(mismatches, 0u);
     EXPECT_TRUE(queue.Empty());
 }
 

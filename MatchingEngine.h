@@ -59,5 +59,9 @@ private:
     Orderbook book_;
     Commands inbound_;
     TradeQueue outbound_;
-    std::jthread thread_; // last: every member it reads is initialised before it starts
+    // std::thread, not std::jthread: Apple Clang 17's libc++ (the README's floor)
+    // lacks jthread, and nothing here needs it — Stop() joins explicitly and no
+    // stop_token is ever requested. Last member: every member it reads is
+    // initialised before it starts.
+    std::thread thread_;
 };
