@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include "FunctionRef.h"
 #include "TradeInfo.h"
 
 class Trade
@@ -18,3 +19,9 @@ private:
 };
 
 using Trades = std::vector<Trade>;
+
+// How the book reports a fill: invoked once per trade, the instant it happens,
+// with no container in between. Reporting is the caller's concern — a test
+// collects into a vector, the engine pushes onto its outbound ring, a benchmark
+// discards — so the book neither allocates for it nor bounds it.
+using TradeSink = FunctionRef<void(const Trade &)>;

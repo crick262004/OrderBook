@@ -8,13 +8,13 @@ Orderbook::Orderbook(OrderIndex capacity)
 {
 }
 
-Trades Orderbook::AddOrder(Order order)
+void Orderbook::AddOrder(Order order, TradeSink onTrade)
 {
     // Capacity contract: the id is the position in the flat index, so an id at
     // or beyond capacity is rejected exactly like a duplicate.
     if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()] != Constants::InvalidIndex)
     {
-        return {};
+        return;
     }
 
     if (order.GetOrderType() == OrderType::Market)
@@ -25,38 +25,38 @@ Trades Orderbook::AddOrder(Order order)
         {
             if (!order.ToGoodTillCancel(asks_.WorstPrice()))
             {
-                return {};
+                return;
             }
         }
         else if (order.GetSide() == Side::Sell && !bids_.Empty())
         {
             if (!order.ToGoodTillCancel(bids_.WorstPrice()))
             {
-                return {};
+                return;
             }
         }
         else
         {
-            return {};
+            return;
         }
     }
 
     if (order.GetOrderType() == OrderType::FillAndKill && !CanMatch(order.GetSide(), order.GetPrice()))
     {
-        return {};
+        return;
     }
 
     if (order.GetOrderType() == OrderType::FillOrKill &&
         !CanFullyFill(order.GetSide(), order.GetPrice(), order.GetInitialQuantity()))
     {
-        return {};
+        return;
     }
 
     const auto slot = pool_.Alloc(std::move(order));
     if (slot == Constants::InvalidIndex)
     {
         // Pool full: backpressure, the order is rejected with the book untouched.
-        return {};
+        return;
     }
 
     // The slot is the order's single home from here on; read via the pool,
@@ -71,7 +71,7 @@ Trades Orderbook::AddOrder(Order order)
         Rest(asks_, slot);
     }
 
-    return MatchOrders(side);
+    MatchOrders(side, onTrade);
 }
 
 template <typename Levels>
@@ -150,24 +150,25 @@ void Orderbook::PruneGoodForDayOrders()
     }
 
     // Internal call into public CancelOrder
-    // small trivial scalars → copy; anything with an expensive copy constructor (shared_ptr, string, vector) or big footprint → const&
+    // small trivial scalars → copy; anything with an expensive copy constructor (shared_ptr, string, vector) or big
+    // footprint → const&
     for (const auto orderId : goodForDayIds)
     {
         CancelOrder(orderId);
     }
 }
 
-Trades Orderbook::ModifyOrder(OrderModify order)
+void Orderbook::ModifyOrder(OrderModify order, TradeSink onTrade)
 {
     if (order.GetOrderId() >= orders_.size() || orders_[order.GetOrderId()] == Constants::InvalidIndex)
     {
-        return {};
+        return;
     }
 
     const auto orderType = pool_[orders_[order.GetOrderId()]].GetOrderType();
 
     CancelOrder(order.GetOrderId());
-    return AddOrder(order.ToOrder(orderType));
+    AddOrder(order.ToOrder(orderType), onTrade);
 }
 
 std::size_t Orderbook::Size() const noexcept
@@ -234,25 +235,13 @@ bool Orderbook::CanMatch(Side side, Price price) const
     return !bids_.Empty() && price <= bids_.BestPrice();
 }
 
-Trades Orderbook::MatchOrders(Side takerSide)
+void Orderbook::MatchOrders(Side takerSide, TradeSink onTrade)
 {
-    // Most adds don't cross the book: bail out before Trades allocates anything.
+    // Most adds don't cross the book: one compare of the two touches and out.
     if (bids_.Empty() || asks_.Empty() || bids_.BestPrice() < asks_.BestPrice())
     {
-        return {};
+        return;
     }
-
-    // The book is never crossed at rest, so the crossing order is the taker, and
-    // it is alone at its level: the front of its side's best level.
-    const Level &takerLevel = takerSide == Side::Buy ? bids_.Best() : asks_.Best();
-    const Level &makerLevel = takerSide == Side::Buy ? asks_.Best() : bids_.Best();
-    const Quantity takerQuantity = pool_[takerLevel.head_].GetRemainingQuantity();
-
-    Trades trades;
-    // Common case: the taker is consumed within the best opposite level, so
-    // trades <= min(taker quantity, orders resting there). A deeper sweep grows
-    // the vector geometrically — rare, and never a capacity-sized reservation.
-    trades.reserve(std::min<std::size_t>(takerQuantity, makerLevel.count_));
 
     while (!bids_.Empty() && !asks_.Empty() && bids_.BestPrice() >= asks_.BestPrice())
     {
@@ -283,8 +272,10 @@ Trades Orderbook::MatchOrders(Side takerSide)
             // crossed at rest, so the resting side is always opposite the incoming taker.
             const Price executionPrice = takerSide == Side::Buy ? ask.GetPrice() : bid.GetPrice();
 
-            trades.push_back(Trade{TradeInfo{bid.GetOrderId(), executionPrice, quantity},
-                                   TradeInfo{ask.GetOrderId(), executionPrice, quantity}});
+            // Report the fill the instant it happens: no container, nothing to
+            // size or clear. What the sink does with it is the caller's business.
+            onTrade(Trade{TradeInfo{bid.GetOrderId(), executionPrice, quantity},
+                          TradeInfo{ask.GetOrderId(), executionPrice, quantity}});
 
             // Aggregates live on the level: no lookup, and the Level is already hot.
             // executionPrice is a reporting concept; the quantity left each order's
@@ -325,7 +316,8 @@ Trades Orderbook::MatchOrders(Side takerSide)
         }
     }
 
-    // A partially filled FillAndKill never rests: it is the taker, still alone at
+    // A partially filled FillAndKill never rests. The book is never crossed at
+    // rest, so the crossing order is the taker, and it is alone at its level:
     // the front of its side's best level. (In the legacy code this public
     // CancelOrder call self-deadlocked on the held non-recursive mutex; it is
     // plainly safe in the single-threaded book.)
@@ -339,6 +331,4 @@ Trades Orderbook::MatchOrders(Side takerSide)
             CancelOrder(remainder.GetOrderId());
         }
     }
-
-    return trades;
 }

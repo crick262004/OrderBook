@@ -5,3 +5,4 @@ BreakBeforeBraces: Allman
 PointerAlignment: Right
 AllowShortFunctionsOnASingleLine: Inline
 AlwaysBreakTemplateDeclarations: Yes
+AccessModifierOffset: -4

@@ -20,14 +20,19 @@
 // hot path. Everything else is a non-owning view whose validity ends when the
 // slot is freed or when the level's side creates or erases a level.
 //
-// Single-threaded by design: no internal locking. The book never reads a clock;
-// deciding when the trading day ends is the caller's policy — GoodForDay orders
-// rest like GoodTillCancel until PruneGoodForDayOrders() is called at close.
+// Single-threaded by design: no internal locking. Exactly one thread owns a book
+// (MatchingEngine gives it a dedicated one, fed by SPSC rings); the book itself
+// knows nothing about threads. It never reads a clock either: deciding when the
+// trading day ends is the caller's policy — GoodForDay orders rest like
+// GoodTillCancel until PruneGoodForDayOrders() is called at close.
+//
+// Fills are reported through a TradeSink, invoked once per trade as it happens:
+// the book does no allocation and keeps no container for reporting.
 //
 // Capacity contract: `capacity` bounds both the number of resting orders and
 // the order-id space — ids are venue-assigned dense integers in [0, capacity).
 // An id outside that range, a duplicate id, or a full pool rejects the order
-// (empty Trades, book untouched) — backpressure, never a throw, never a resize.
+// (no trades, book untouched) — backpressure, never a throw, never a resize.
 class Orderbook
 {
 public:
@@ -40,9 +45,9 @@ public:
     Orderbook &operator=(Orderbook &&) = delete;
     ~Orderbook() = default;
 
-    Trades AddOrder(Order order);
+    void AddOrder(Order order, TradeSink onTrade);
     void CancelOrder(OrderId orderId);
-    Trades ModifyOrder(OrderModify order);
+    void ModifyOrder(OrderModify order, TradeSink onTrade);
     void PruneGoodForDayOrders();
 
     [[nodiscard]] std::size_t Size() const noexcept;
@@ -67,7 +72,7 @@ private:
 
     [[nodiscard]] bool CanFullyFill(Side side, Price price, Quantity quantity) const;
     [[nodiscard]] bool CanMatch(Side side, Price price) const;
-    Trades MatchOrders(Side takerSide);
+    void MatchOrders(Side takerSide, TradeSink onTrade);
 
     Bids bids_;
     Asks asks_;

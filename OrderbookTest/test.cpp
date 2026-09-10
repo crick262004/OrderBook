@@ -7,11 +7,16 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "Command.h"
 #include "Constants.h"
+#include "FunctionRef.h"
+#include "MatchingEngine.h"
 #include "Order.h"
 #include "OrderModify.h"
 #include "OrderPool.h"
@@ -19,11 +24,13 @@
 #include "Orderbook.h"
 #include "PriceLevels.h"
 #include "Side.h"
+#include "SpscQueue.h"
 #include "Trade.h"
 #include "Usings.h"
 
 // File-driven scenarios: each TestFiles/*.txt is a script of actions replayed
-// against a fresh Orderbook, then checked against expected trades and book state.
+// against a fresh Orderbook — directly, and again through the MatchingEngine's
+// rings and thread — then checked against expected trades and book state.
 //
 //   A <B|S> <OrderType> <price> <quantity> <orderId>   add an order
 //   M <orderId> <B|S> <price> <quantity>               modify (cancel + re-add)
@@ -256,38 +263,36 @@ Scenario ParseScenario(const std::filesystem::path &path)
     return scenario;
 }
 
-class OrderbookScenarioTest : public testing::TestWithParam<const char *>
+Order ToOrder(const Action &action)
 {
-};
+    return Order{action.orderType_, action.orderId_, action.side_, action.price_, action.quantity_};
+}
 
-TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
+OrderModify ToModify(const Action &action)
 {
-    // Arrange
-    const auto file = std::filesystem::path{TEST_FILES_DIR} / GetParam();
-    const auto scenario = ParseScenario(file);
+    return OrderModify{action.orderId_, action.side_, action.price_, action.quantity_};
+}
 
-    // Act
-    Orderbook orderbook;
+// Sink for callers that don't care about fills: a namespace-scope lambda is a
+// class-type lvalue, exactly what FunctionRef binds to.
+constexpr auto IgnoreTrades = [](const Trade &) {};
+
+// Replays the actions straight into a book; every fill lands in the returned vector.
+Trades ReplayDirect(const Scenario &scenario, Orderbook &orderbook)
+{
     Trades trades;
+    const auto collect = [&trades](const Trade &trade) { trades.push_back(trade); };
 
     for (const auto &action : scenario.actions_)
     {
         switch (action.type_)
         {
         case ActionType::Add:
-        {
-            const auto newTrades = orderbook.AddOrder(
-                Order{action.orderType_, action.orderId_, action.side_, action.price_, action.quantity_});
-            trades.insert(trades.end(), newTrades.begin(), newTrades.end());
+            orderbook.AddOrder(ToOrder(action), collect);
             break;
-        }
         case ActionType::Modify:
-        {
-            const auto newTrades =
-                orderbook.ModifyOrder(OrderModify{action.orderId_, action.side_, action.price_, action.quantity_});
-            trades.insert(trades.end(), newTrades.begin(), newTrades.end());
+            orderbook.ModifyOrder(ToModify(action), collect);
             break;
-        }
         case ActionType::Cancel:
             orderbook.CancelOrder(action.orderId_);
             break;
@@ -297,6 +302,46 @@ TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
         }
     }
 
+    return trades;
+}
+
+// Replays the actions as commands through the engine's inbound ring, stops it,
+// and drains the outbound ring. The Stop pill guarantees every command was applied.
+Trades ReplayThroughEngine(const Scenario &scenario, MatchingEngine &engine)
+{
+    for (const auto &action : scenario.actions_)
+    {
+        switch (action.type_)
+        {
+        case ActionType::Add:
+            engine.Submit(Command::Add(ToOrder(action)));
+            break;
+        case ActionType::Modify:
+            engine.Submit(Command::Modify(ToModify(action)));
+            break;
+        case ActionType::Cancel:
+            engine.Submit(Command::Cancel(action.orderId_));
+            break;
+        case ActionType::Prune:
+            engine.Submit(Command::Prune());
+            break;
+        }
+    }
+
+    engine.Stop();
+
+    Trades trades;
+    while (const Trade *trade = engine.NextTrade())
+    {
+        trades.push_back(*trade);
+        engine.PopTrade();
+    }
+
+    return trades;
+}
+
+void ExpectScenarioOutcome(const Scenario &scenario, const Trades &trades, const Orderbook &orderbook)
+{
     // Assert trade contents, not just final counts (legacy bug #6).
     ASSERT_EQ(trades.size(), scenario.trades_.size());
     for (std::size_t i = 0; i < trades.size(); ++i)
@@ -318,11 +363,36 @@ TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
     EXPECT_EQ(levels.GetAsks().size(), scenario.result_.askLevelCount_);
 }
 
+class OrderbookScenarioTest : public testing::TestWithParam<const char *>
+{
+};
+
+TEST_P(OrderbookScenarioTest, ReplaysFileScenario)
+{
+    const auto scenario = ParseScenario(std::filesystem::path{TEST_FILES_DIR} / GetParam());
+
+    Orderbook orderbook;
+    const auto trades = ReplayDirect(scenario, orderbook);
+
+    ExpectScenarioOutcome(scenario, trades, orderbook);
+}
+
+// The same scenario across the thread boundary must produce the identical trade
+// sequence and book: the rings preserve order and lose nothing.
+TEST_P(OrderbookScenarioTest, ReplaysFileScenarioThroughTheEngine)
+{
+    const auto scenario = ParseScenario(std::filesystem::path{TEST_FILES_DIR} / GetParam());
+
+    MatchingEngine engine;
+    const auto trades = ReplayThroughEngine(scenario, engine);
+
+    ExpectScenarioOutcome(scenario, trades, engine.Book());
+}
+
 constexpr const char *ScenarioFiles[] = {
-    "Match_GoodTillCancel.txt", "Match_FillAndKill.txt",     "Match_FillAndKill_Partial.txt",
-    "Match_FillOrKill_Hit.txt", "Match_FillOrKill_Miss.txt", "Match_Market.txt",
-    "Match_PriceImprovement.txt", "Cancel_Success.txt",      "Modify_Side.txt",
-    "Prune_GoodForDay.txt",     "Prune_NoGoodForDay.txt",
+    "Match_GoodTillCancel.txt",  "Match_FillAndKill.txt", "Match_FillAndKill_Partial.txt", "Match_FillOrKill_Hit.txt",
+    "Match_FillOrKill_Miss.txt", "Match_Market.txt",      "Match_PriceImprovement.txt",    "Cancel_Success.txt",
+    "Modify_Side.txt",           "Prune_GoodForDay.txt",  "Prune_NoGoodForDay.txt",
 };
 
 INSTANTIATE_TEST_SUITE_P(Scenarios, OrderbookScenarioTest, testing::ValuesIn(ScenarioFiles));
@@ -369,10 +439,10 @@ TEST(OrderbookCapacityTest, RejectsIdAtOrBeyondCapacity)
 {
     Orderbook orderbook{4};
 
-    EXPECT_TRUE(orderbook.AddOrder(Order{OrderType::GoodTillCancel, 4, Side::Buy, 100, 10}).empty());
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 4, Side::Buy, 100, 10}, IgnoreTrades);
     EXPECT_EQ(orderbook.Size(), 0u);
 
-    EXPECT_TRUE(orderbook.AddOrder(Order{OrderType::GoodTillCancel, 3, Side::Buy, 100, 10}).empty());
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 3, Side::Buy, 100, 10}, IgnoreTrades);
     EXPECT_EQ(orderbook.Size(), 1u);
 }
 
@@ -380,8 +450,8 @@ TEST(OrderbookCapacityTest, RejectsDuplicateIdWhileLive)
 {
     Orderbook orderbook{4};
 
-    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 100, 10});
-    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 105, 5});
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 100, 10}, IgnoreTrades);
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 105, 5}, IgnoreTrades);
     EXPECT_EQ(orderbook.Size(), 1u);
 
     const auto levels = orderbook.GetOrderInfos();
@@ -393,11 +463,11 @@ TEST(OrderbookCapacityTest, IdReusableAfterCancel)
 {
     Orderbook orderbook{2};
 
-    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Buy, 100, 10});
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Buy, 100, 10}, IgnoreTrades);
     orderbook.CancelOrder(0);
     EXPECT_EQ(orderbook.Size(), 0u);
 
-    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Sell, 105, 5});
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Sell, 105, 5}, IgnoreTrades);
     EXPECT_EQ(orderbook.Size(), 1u);
 
     const auto levels = orderbook.GetOrderInfos();
@@ -576,9 +646,11 @@ TEST(LevelQueueTest, UnlinkedSlotRecyclesWithoutDisturbingTheQueue)
 TEST(OrderbookLevelTest, LevelQuantityTracksRemainingAfterPartialFill)
 {
     Orderbook orderbook{4};
+    Trades trades;
+    const auto collect = [&trades](const Trade &trade) { trades.push_back(trade); };
 
-    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Sell, 100, 10});
-    const auto trades = orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 100, 30});
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 0, Side::Sell, 100, 10}, collect);
+    orderbook.AddOrder(Order{OrderType::GoodTillCancel, 1, Side::Buy, 100, 30}, collect);
     ASSERT_EQ(trades.size(), 1u);
 
     auto levels = orderbook.GetOrderInfos();
@@ -591,6 +663,139 @@ TEST(OrderbookLevelTest, LevelQuantityTracksRemainingAfterPartialFill)
     levels = orderbook.GetOrderInfos();
     EXPECT_TRUE(levels.GetBids().empty());
     EXPECT_EQ(orderbook.Size(), 0u);
+}
+
+// FunctionRef: two words, no allocation, borrows the callable and its captures.
+static_assert(sizeof(TradeSink) == 2 * sizeof(void *));
+static_assert(std::is_trivially_copyable_v<TradeSink>);
+
+TEST(FunctionRefTest, InvokesTheBorrowedCallableWithItsCaptures)
+{
+    int calls = 0;
+    Quantity total = 0;
+    auto tally = [&](const Trade &trade)
+    {
+        ++calls;
+        total += trade.GetBidTrade().quantity_;
+    };
+
+    const TradeSink sink{tally};
+    sink(Trade{TradeInfo{1, 100, 7}, TradeInfo{2, 100, 7}});
+    sink(Trade{TradeInfo{1, 100, 5}, TradeInfo{3, 100, 5}});
+
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(total, 12u);
+}
+
+// The ring, single-threaded first: FIFO order, full and empty reported exactly,
+// and the mask wrapping the counters back over the same slots.
+TEST(SpscQueueTest, PushPopIsFifoAndReportsFullAndEmpty)
+{
+    SpscQueue<std::uint64_t, 4> queue;
+    EXPECT_TRUE(queue.Empty());
+    EXPECT_EQ(queue.Front(), nullptr);
+
+    for (std::uint64_t i = 0; i < 4; ++i)
+    {
+        EXPECT_TRUE(queue.TryPush(i));
+    }
+    EXPECT_EQ(queue.Size(), 4u);
+    EXPECT_FALSE(queue.TryPush(99)); // full: every slot usable, no sacrificed one
+
+    for (std::uint64_t i = 0; i < 4; ++i)
+    {
+        ASSERT_NE(queue.Front(), nullptr);
+        EXPECT_EQ(*queue.Front(), i);
+        queue.Pop();
+    }
+    EXPECT_TRUE(queue.Empty());
+
+    // Past the first lap the counters exceed the capacity; the mask brings the
+    // slots back around.
+    for (std::uint64_t i = 10; i < 16; ++i)
+    {
+        EXPECT_TRUE(queue.TryPush(i));
+        ASSERT_NE(queue.Front(), nullptr);
+        EXPECT_EQ(*queue.Front(), i);
+        queue.Pop();
+    }
+    EXPECT_EQ(queue.Front(), nullptr);
+}
+
+// Two threads, a ring far smaller than the sequence so it fills and wraps
+// thousands of times: every element must arrive exactly once, in order.
+TEST(SpscQueueTest, DeliversTheWholeSequenceInOrderAcrossThreads)
+{
+    constexpr std::uint64_t Count = 200'000;
+    SpscQueue<std::uint64_t, 8> queue;
+
+    std::jthread producer{[&queue]
+                          {
+                              for (std::uint64_t i = 0; i < Count; ++i)
+                              {
+                                  while (!queue.TryPush(i))
+                                  {
+                                  }
+                              }
+                          }};
+
+    for (std::uint64_t expected = 0; expected < Count; ++expected)
+    {
+        const std::uint64_t *item = nullptr;
+        while ((item = queue.Front()) == nullptr)
+        {
+        }
+        ASSERT_EQ(*item, expected);
+        queue.Pop();
+    }
+
+    producer.join();
+    EXPECT_TRUE(queue.Empty());
+}
+
+// The poison pill queues behind everything submitted before it, so Stop()
+// returning means every command was applied — nothing to poll or flush.
+TEST(MatchingEngineTest, StopAppliesEveryCommandSubmittedBeforeIt)
+{
+    constexpr OrderId Count = 5'000;
+    MatchingEngine engine{Count};
+
+    for (OrderId id = 0; id < Count; ++id)
+    {
+        engine.Submit(Command::Add(Order{OrderType::GoodTillCancel, id, Side::Buy, 100, 1}));
+    }
+    engine.Stop();
+
+    EXPECT_EQ(engine.Book().Size(), Count);
+    EXPECT_EQ(engine.NextTrade(), nullptr);
+}
+
+TEST(MatchingEngineTest, ReportsEachFillOnceInOrderThroughTheOutboundRing)
+{
+    MatchingEngine engine{8};
+
+    engine.Submit(Command::Add(Order{OrderType::GoodTillCancel, 0, Side::Sell, 100, 5}));
+    engine.Submit(Command::Add(Order{OrderType::GoodTillCancel, 1, Side::Sell, 101, 5}));
+    engine.Submit(Command::Add(Order{OrderType::GoodTillCancel, 2, Side::Buy, 101, 8})); // sweeps 100 then 101
+    engine.Submit(Command::Cancel(1)); // ask 1's 2-lot remainder; bid 2 is fully filled
+    engine.Stop();
+
+    const Trade *first = engine.NextTrade();
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->GetAskTrade().orderId_, 0u);
+    EXPECT_EQ(first->GetAskTrade().price_, 100);
+    EXPECT_EQ(first->GetBidTrade().quantity_, 5u);
+    engine.PopTrade();
+
+    const Trade *second = engine.NextTrade();
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second->GetAskTrade().orderId_, 1u);
+    EXPECT_EQ(second->GetAskTrade().price_, 101);
+    EXPECT_EQ(second->GetBidTrade().quantity_, 3u);
+    engine.PopTrade();
+
+    EXPECT_EQ(engine.NextTrade(), nullptr);
+    EXPECT_EQ(engine.Book().Size(), 0u);
 }
 
 } // namespace
