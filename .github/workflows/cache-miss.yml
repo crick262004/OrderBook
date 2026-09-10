@@ -1,0 +1,35 @@
+name: Cache misses
+
+# Roadmap 3.4: the misses behind the ns numbers. Runs tools/cachestat.sh — every
+# optimization commit rebuilt and run under valgrind's cache simulator — and
+# writes the table to the job summary. Linux only (valgrind has no Apple Silicon
+# port); manual, or whenever the script or this workflow changes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - tools/cachestat.sh
+      - .github/workflows/cache-miss.yml
+
+jobs:
+  cachegrind:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # every optimization commit must be reachable
+
+      - name: Install valgrind and select GCC 14
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Measure # the script also appends its table to the job summary
+        run: tools/cachestat.sh | tee cachestat.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cachestat
+          path: cachestat.md

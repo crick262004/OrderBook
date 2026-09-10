@@ -47,7 +47,7 @@ one row per optimization commit, all measured on the same machine (±10% laptop 
 | `927f6c4` | Flat levels: sorted price arrays with the touch at the back, aggregates on the level, no `std::map`/hash | 22 / 25 / 29 | 57 / 60 / 61 |
 | `3a981ec` | Intrusive FIFO: orders are their own queue nodes, linked through pool slots; no `std::list`, zero per-order allocation | 14 / 15 / 21 | 34 / 37 / 40 |
 | `a24ee1f` | Trade sink: fills go to a 16-byte `function_ref` callback instead of a returned `std::vector<Trade>`; the last allocation is gone | 13 / 15 / 23 | 23 / 28 / 34 |
-| `TBD` | Padded ring counters: one cache line per SPSC counter plus a cached copy of the peer's, no false sharing (book untouched; see the threading table) | 12 / 15 / 19 | 23 / 30 / 32 |
+| `563be41` | Padded ring counters: one cache line per SPSC counter plus a cached copy of the peer's, no false sharing (book untouched; see the threading table) | 12 / 15 / 19 | 23 / 30 / 32 |
 
 The bench replaces global `operator new` and reports heap allocations per iteration as an
 `allocs` counter. Since the trade sink it reads `allocs=0` on every benchmark: the book
@@ -71,6 +71,23 @@ The padded/packed pair is the false-sharing measurement: same code, same run, on
 layout differs, so the 110 ns gap is the tax of two writers sharing a cache line. The
 ~20 µs max in both layouts is OS preemption of an unpinned spinning thread — the number
 thread pinning targets.
+
+### Cache misses
+
+Every number above is wall-clock; the claim behind them is "fewer cache misses". The
+[`Cache misses`](.github/workflows/cache-miss.yml) workflow measures that directly:
+`tools/cachestat.sh` rebuilds each optimization commit and runs the add+cancel and match
+benchmarks under valgrind's cache simulator (`callgrind --cache-sim=yes`, a fixed 32 KB L1D /
+8 MB LL geometry, misses counted only inside the benchmark function), reporting data-cache
+misses per operation. A simulation is deterministic — the same binary gives the same count
+to the digit — and runs on a CI VM whose hypervisor hides the hardware counters; what it
+cannot say is how long a miss took, so it proves *fewer* while the ns table proves
+*faster*. Results land in the workflow's job summary; the per-commit table is copied here
+after each run.
+
+| Commit | L1D misses / add+cancel | L1D misses / match | LL misses / match |
+|---|---|---|---|
+| _pending first Linux run_ | | | |
 
 Pinning (`ScopedPin`, `MatchingEngine{capacity, core}`) is hard affinity on Linux, verified in
 CI by asking the kernel which core the pinned thread runs on. macOS offers no hard affinity, so
