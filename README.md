@@ -78,16 +78,32 @@ Every number above is wall-clock; the claim behind them is "fewer cache misses".
 [`Cache misses`](.github/workflows/cache-miss.yml) workflow measures that directly:
 `tools/cachestat.sh` rebuilds each optimization commit and runs the add+cancel and match
 benchmarks under valgrind's cache simulator (`callgrind --cache-sim=yes`, a fixed 32 KB L1D /
-8 MB LL geometry, misses counted only inside the benchmark function), reporting data-cache
-misses per operation. A simulation is deterministic — the same binary gives the same count
-to the digit — and runs on a CI VM whose hypervisor hides the hardware counters; what it
-cannot say is how long a miss took, so it proves *fewer* while the ns table proves
-*faster*. Results land in the workflow's job summary; the per-commit table is copied here
-after each run.
+8 MB LL geometry). Each benchmark runs for N and 2N iterations and the per-operation cost is
+the difference over N, so construction, fill and harness cancel exactly. A simulation is
+deterministic — the same binary gives the same count to the digit — and runs on a CI VM
+whose hypervisor hides the hardware counters; what it cannot say is how long a miss took, so
+it proves *fewer* while the ns table proves *faster*.
 
-| Commit | L1D misses / add+cancel | L1D misses / match | LL misses / match |
-|---|---|---|---|
-| _pending first Linux run_ | | | |
+| Commit | Change | instructions / add+cancel | instructions / match | L1D misses / match |
+|---|---|---|---|---|
+| `5dd83af` | Baseline: `shared_ptr`, `std::map`, hash map | 1176 / 1224 | 3342 / 3422 | 9 / 17 |
+| `5b18318` | Single ownership, orders by value in list nodes | 887 / 931 | 2798 / 2866 | 0 / 13 |
+| `f6bf84b` | Arena: pooled orders, no heap on the hot path | 633 / 677 | 2337 / 2393 | 0 / 0 |
+| `927f6c4` | Flat price levels | 675 / 741 | 1240 / 1284 | 0 / 0 |
+| `3a981ec` | Intrusive FIFO | 500 / 566 | 811 / 855 | 0 / 0 |
+| `a24ee1f` | Trade sink | 492 / 558 | 629 / 673 | 0 / 0 |
+
+Cells are depth 1,000 / depth 10,000. L1D misses per add+cancel and last-level misses are
+zero at every commit and depth. Two honest readings:
+
+- **The misses went away between the baseline and the arena** — 17 → 13 → 0 per match at
+  depth 10,000 — exactly where `malloc`/`free` left the hot path. Every later version stays
+  at zero. From the arena on, the wall-clock gains are **instruction count and IPC**:
+  2393 → 1284 → 855 → 673 instructions per match, tracked by 148 → 61 → 40 → 34 ns.
+- **These are steady-state micro-benchmarks**: each iteration touches the same level and
+  the same slot, so the working set fits L1 whatever the layout. The layout arguments
+  (contiguous price arrays, two orders per line) are about *real* order flow across the
+  whole book, which the Phase 4 ITCH replay will measure.
 
 Pinning (`ScopedPin`, `MatchingEngine{capacity, core}`) is hard affinity on Linux, verified in
 CI by asking the kernel which core the pinned thread runs on. macOS offers no hard affinity, so
